@@ -1,6 +1,6 @@
 """
-LibGen Main API - FINAL WORKING VERSION
-Search with results limit + working download links
+LibGen Main API - With Relevance Ranking
+Results ranked by relevance to search query
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -15,12 +15,14 @@ import uvicorn
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 
 # ========== FASTAPI APP ==========
 
 app = FastAPI(
     title="LibGen Main API",
-    version="9.0.0"
+    version="10.0.0",
+    description="Search LibGen with relevance ranking"
 )
 
 # ========== CORS ==========
@@ -66,6 +68,83 @@ class SimpleCache:
 
 cache = SimpleCache()
 
+# ========== RELEVANCE SCORING ==========
+
+class RelevanceScorer:
+    @staticmethod
+    def calculate_score(book: Dict, query: str) -> float:
+        """Calculate relevance score for a book based on query"""
+        query_words = query.lower().split()
+        score = 0.0
+        
+        # Get all text fields for matching
+        title = book.get('title', '').lower()
+        author = book.get('author', '').lower()
+        publisher = book.get('publisher', '').lower()
+        year = book.get('year', '').lower()
+        language = book.get('language', '').lower()
+        
+        # Score: Title matches (highest weight)
+        title_score = 0
+        for word in query_words:
+            if word in title:
+                # Exact phrase match in title gets bonus
+                if query.lower() in title:
+                    title_score += 100
+                else:
+                    title_score += 20
+        score += title_score * 2.0  # Title is most important
+        
+        # Score: Author matches (high weight)
+        author_score = 0
+        for word in query_words:
+            if word in author:
+                author_score += 15
+        score += author_score * 1.5
+        
+        # Score: Publisher matches (medium weight)
+        publisher_score = 0
+        for word in query_words:
+            if word in publisher:
+                publisher_score += 5
+        score += publisher_score
+        
+        # Score: Year matches (low weight)
+        year_score = 0
+        for word in query_words:
+            if word in year:
+                year_score += 2
+        score += year_score
+        
+        # Score: Language matches (low weight)
+        lang_score = 0
+        for word in query_words:
+            if word in language:
+                lang_score += 1
+        score += lang_score
+        
+        # Bonus for exact phrase matches
+        if query.lower() in title:
+            score += 50
+        if query.lower() in author:
+            score += 20
+        
+        # Penalty for long titles with many extra words (less relevant)
+        title_words = len(title.split())
+        if title_words > 15:
+            score *= 0.9
+        
+        return score
+    
+    @staticmethod
+    def rank_results(results: List[Dict], query: str) -> List[Dict]:
+        """Rank results by relevance score"""
+        for book in results:
+            book['_relevance_score'] = RelevanceScorer.calculate_score(book, query)
+        
+        # Sort by score descending
+        return sorted(results, key=lambda x: x.get('_relevance_score', 0), reverse=True)
+
 # ========== LIBGEN ENGINE ==========
 
 class LibGenEngine:
@@ -79,6 +158,7 @@ class LibGenEngine:
             'Connection': 'keep-alive',
         })
         self.adbypass_api = ADBYPASS_API
+        self.scorer = RelevanceScorer()
 
     def search(self, query: str, max_pages: int = 1, limit: int = 25, filters: Dict = None) -> Dict:
         start_time = time.time()
@@ -98,7 +178,7 @@ class LibGenEngine:
         total_available = 0
         pages_fetched = 0
         
-        # Fetch pages
+        # Fetch pages in parallel
         with ThreadPoolExecutor(max_workers=max_pages) as executor:
             futures = [
                 executor.submit(self._fetch_page, query, page, filters) 
@@ -114,7 +194,7 @@ class LibGenEngine:
                             total_available = page_total
                         pages_fetched += 1
                         
-                        if len(all_results) >= limit:
+                        if len(all_results) >= limit * 2:  # Fetch extra for ranking
                             for f in futures:
                                 if not f.done():
                                     f.cancel()
@@ -122,8 +202,11 @@ class LibGenEngine:
                 except:
                     pass
         
-        # ✅ FIX: Limit results but keep ALL metadata including download_url
-        limited_results = all_results[:limit]
+        # ✅ RANK RESULTS BY RELEVANCE
+        ranked_results = self.scorer.rank_results(all_results, query)
+        
+        # Apply limit after ranking
+        limited_results = ranked_results[:limit]
         
         response = {
             'query': query,
@@ -131,6 +214,7 @@ class LibGenEngine:
             'total_available': total_available,
             'pages_fetched': pages_fetched,
             'limit_applied': limit,
+            'ranking_applied': True,
             'results': limited_results
         }
         
@@ -183,7 +267,7 @@ class LibGenEngine:
                     else:
                         page_results.append(book)
             
-            # ✅ Bypass ads
+            # Batch bypass
             if ads_urls:
                 real_urls = self._batch_bypass(ads_urls)
                 for book, real_url in zip(ads_books, real_urls):
@@ -241,7 +325,6 @@ class LibGenEngine:
         return f"{self.base_url}/index.php?req={query}&res=25&filesuns=all&curtab=f&page={page}"
 
     def _parse_row(self, row, cells) -> Optional[Dict]:
-        """✅ FIXED: Always extract download_url properly"""
         try:
             bold = cells[0].find('b')
             title = bold.get_text(strip=True) if bold else cells[0].get_text(strip=True)[:80]
@@ -251,24 +334,22 @@ class LibGenEngine:
             ads_url = None
             download_url = None
             
-            # ✅ First pass: Find get.php with key (already real URL)
+            # First pass: get.php with key
             for cell in cells:
                 for link in cell.find_all('a'):
                     href = link.get('href', '')
                     
-                    # get.php with key = already real URL
                     if 'get.php?md5=' in href and '&key=' in href:
                         match = re.search(r'md5=([a-f0-9]{32})', href)
                         if match:
                             md5 = match.group(1)
                             download_url = f"{self.base_url}{href}"
-                            print(f"✅ Found direct URL: {download_url}")
                             break
                 
                 if download_url:
                     break
             
-            # ✅ Second pass: Find ads.php (needs bypass)
+            # Second pass: ads.php
             if not download_url:
                 for cell in cells:
                     for link in cell.find_all('a'):
@@ -279,13 +360,12 @@ class LibGenEngine:
                             if match:
                                 md5 = match.group(1)
                                 ads_url = f"{self.base_url}{href}"
-                                print(f"🔄 Found ads URL: {ads_url}")
                                 break
                     
                     if ads_url:
                         break
             
-            # ✅ Third pass: Find get.php without key (need ads.php fallback)
+            # Third pass: get.php without key
             if not download_url and not ads_url:
                 for cell in cells:
                     for link in cell.find_all('a'):
@@ -296,7 +376,6 @@ class LibGenEngine:
                             if match:
                                 md5 = match.group(1)
                                 ads_url = f"{self.base_url}/ads.php?md5={md5}"
-                                print(f"🔄 Created ads URL from get.php: {ads_url}")
                                 break
                     
                     if ads_url:
@@ -313,13 +392,12 @@ class LibGenEngine:
                 'extension': cells[7].get_text(strip=True).lower() if len(cells) > 7 else 'unknown',
                 'md5': md5,
                 'ads_url': ads_url,
-                'download_url': download_url,  # ✅ This will be filled by bypass
+                'download_url': download_url,
                 'bypass_success': False,
                 'is_book': bool(row.find('span', class_='badge', string=re.compile(r'b'))),
                 'is_comic': bool(row.find('span', class_='badge', string=re.compile(r'c')))
             }
-        except Exception as e:
-            print(f"Parse error: {e}")
+        except:
             return None
 
     def _apply_filters(self, book: Dict, filters: Dict) -> bool:
@@ -383,8 +461,15 @@ engine = LibGenEngine()
 async def root():
     return {
         "name": "LibGen API",
-        "version": "9.0.0",
-        "description": "Search LibGen with results limit + working download links",
+        "version": "10.0.0",
+        "description": "Search LibGen with relevance ranking",
+        "features": {
+            "relevance_ranking": "Results ranked by relevance to your search query",
+            "download_bypass": "Automatic ad bypass for real download URLs",
+            "caching": "Results cached for 2 hours",
+            "filters": "Format, author, language filters",
+            "limit": "Control number of results"
+        },
         "parameters": {
             "query": "Required - Search term",
             "format": "Optional - File format filter",
@@ -394,8 +479,9 @@ async def root():
             "max_pages": "Optional - Pages to fetch (default: 1, max: 2)"
         },
         "examples": {
-            "get_1_book": "/search?query=think+and+grow+rich&limit=1",
-            "get_5_pdfs": "/search?query=psychology&format=pdf&limit=5"
+            "get_1_relevant_book": "/search?query=think+and+grow+rich&limit=1",
+            "get_top_5_pdfs": "/search?query=psychology&format=pdf&limit=5",
+            "search_by_author": "/search?query=python&author=O%27Reilly&limit=10"
         }
     }
 
@@ -420,7 +506,12 @@ async def search(
     limit: int = Query(25, ge=1, le=50, description="Number of results (max: 50)"),
     max_pages: int = Query(1, ge=1, le=2, description="Pages to fetch (max: 2)")
 ):
-    """⚡ Search with limit + working download links"""
+    """
+    ⚡ Search with relevance ranking
+    
+    Results are ranked by relevance to your search query.
+    The most relevant books appear first.
+    """
     if not query:
         raise HTTPException(400, "Query parameter is required")
     
@@ -452,7 +543,7 @@ async def get_download_url(md5: str):
     start_time = time.time()
     
     if not md5 or len(md5) != 32:
-        raise HTTPException(400, "Invalid MD5 hash")
+        raise HTTPException(400, "Invalid MD5 hash (must be 32 characters)")
     
     try:
         result = engine.get_by_md5(md5)
@@ -471,16 +562,32 @@ async def get_download_url(md5: str):
 async def get_formats():
     return {
         "formats": {
-            "pdf": "PDF",
-            "epub": "EPUB",
-            "mobi": "MOBI",
-            "azw3": "AZW3",
-            "djvu": "DJVU",
-            "doc": "DOC",
-            "txt": "TXT",
-            "fb2": "FB2",
-            "cbr": "CBR",
-            "cbz": "CBZ"
+            "pdf": "PDF Documents",
+            "epub": "EPUB E-books",
+            "mobi": "Mobi (Kindle)",
+            "azw3": "AZW3 (Kindle)",
+            "djvu": "DJVU Scanned",
+            "doc": "Word Documents",
+            "txt": "Plain Text",
+            "fb2": "FictionBook",
+            "cbr": "Comic Book (RAR)",
+            "cbz": "Comic Book (ZIP)"
+        },
+        "languages": {
+            "en": "English",
+            "ru": "Russian",
+            "fr": "French",
+            "de": "German",
+            "es": "Spanish",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "nl": "Dutch",
+            "pl": "Polish",
+            "uk": "Ukrainian",
+            "zh": "Chinese",
+            "ja": "Japanese",
+            "ar": "Arabic",
+            "hi": "Hindi"
         }
     }
 
