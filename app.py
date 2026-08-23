@@ -1,6 +1,6 @@
 """
-LibGen Main API - Lightning Fast
-Optimized with aggressive caching and minimal requests
+LibGen Main API - Ultra-Fast with Time Tracking
+Shows exact time taken for each request
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -13,13 +13,14 @@ import json
 from datetime import datetime, timedelta
 import uvicorn
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== FASTAPI APP ==========
 
 app = FastAPI(
     title="LibGen Main API",
-    version="4.0.0"
+    version="5.0.0"
 )
 
 # ========== CORS ==========
@@ -36,7 +37,7 @@ app.add_middleware(
 
 ADBYPASS_API = os.environ.get("ADBYPASS_API", "https://libgen-adbypass.vercel.app")
 MAX_WORKERS = 10
-TIMEOUT = 8
+TIMEOUT = 5  # ⚡ ULTRA SHORT TIMEOUT
 CACHE_TTL = 7200  # 2 hours
 
 # ========== SIMPLE CACHE ==========
@@ -80,22 +81,24 @@ class LibGenEngine:
         self.adbypass_api = ADBYPASS_API
 
     def search(self, query: str, max_pages: int = 1, filters: Dict = None) -> Dict:
-        """Fast search with minimal overhead"""
+        """Ultra-fast search with time tracking"""
+        start_time = time.time()
+        
         if filters is None:
             filters = {}
         
-        # Generate cache key
-        cache_key = f"{query}:{max_pages}:{json.dumps(filters, sort_keys=True)}"
-        
         # Check cache
+        cache_key = f"{query}:{max_pages}:{json.dumps(filters, sort_keys=True)}"
         cached = cache.get(cache_key)
         if cached:
+            elapsed = time.time() - start_time
+            cached['_time_taken'] = f"{elapsed:.2f}s (cached)"
             return cached
         
-        # Fetch pages in parallel
         results = []
         total_available = 0
         
+        # ⚡ Fetch ALL pages in parallel with ultra short timeout
         with ThreadPoolExecutor(max_workers=max_pages) as executor:
             futures = [
                 executor.submit(self._fetch_page, query, page, filters) 
@@ -103,11 +106,14 @@ class LibGenEngine:
             ]
             
             for future in as_completed(futures):
-                page_results, page_total = future.result()
-                if page_results:
-                    results.extend(page_results)
-                    if page_total:
-                        total_available = page_total
+                try:
+                    page_results, page_total = future.result(timeout=TIMEOUT)
+                    if page_results:
+                        results.extend(page_results)
+                        if page_total:
+                            total_available = page_total
+                except:
+                    pass  # Skip timed-out pages
         
         # Format response
         response = {
@@ -115,15 +121,19 @@ class LibGenEngine:
             'total_results': len(results),
             'total_available': total_available,
             'pages_fetched': max_pages,
-            'results': results
+            'results': results[:50]  # Limit to 50 results for speed
         }
         
         # Cache
         cache.set(cache_key, response)
+        
+        elapsed = time.time() - start_time
+        response['_time_taken'] = f"{elapsed:.2f}s"
+        
         return response
 
     def _fetch_page(self, query: str, page: int, filters: Dict) -> tuple:
-        """Fetch and parse a single page"""
+        """Fetch a single page with ultra short timeout"""
         try:
             url = self._build_search_url(query, page)
             response = self.session.get(url, timeout=TIMEOUT)
@@ -133,7 +143,7 @@ class LibGenEngine:
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Get total count
+            # Get total count quickly
             total_available = 0
             files_tab = soup.find('a', href=re.compile(r'curtab=f'))
             if files_tab:
@@ -153,7 +163,7 @@ class LibGenEngine:
             ads_urls = []
             ads_books = []
             
-            # Parse rows first
+            # Parse rows
             for row in rows:
                 cells = row.find_all('td')
                 if len(cells) < 8:
@@ -167,7 +177,7 @@ class LibGenEngine:
                     else:
                         page_results.append(book)
             
-            # Batch bypass all ads URLs at once
+            # ⚡ Batch bypass with ultra short timeout
             if ads_urls:
                 real_urls = self._batch_bypass(ads_urls)
                 for book, real_url in zip(ads_books, real_urls):
@@ -181,32 +191,34 @@ class LibGenEngine:
             
             return page_results, total_available
             
-        except Exception as e:
+        except:
             return [], 0
 
     def _batch_bypass(self, ads_urls: List[str]) -> List[Optional[str]]:
-        """Parallel batch bypass"""
+        """⚡ Ultra-fast batch bypass with short timeout"""
         if not ads_urls:
             return []
         
-        # Limit workers to avoid rate limiting
-        workers = min(len(ads_urls), 5)
+        # Limit to 3 concurrent to avoid rate limiting
+        workers = min(len(ads_urls), 3)
         
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(self._bypass_single, url): url for url in ads_urls}
             results = []
             for future in as_completed(futures):
-                results.append(future.result())
+                try:
+                    results.append(future.result(timeout=3))  # ⚡ 3 second timeout
+                except:
+                    results.append(None)
             return results
 
     def _bypass_single(self, ads_url: str) -> Optional[str]:
-        """Single URL bypass with timeout"""
+        """⚡ Single URL bypass with 2 second timeout"""
         try:
-            # Quick request to AdBypass API
             resp = self.session.post(
                 f"{self.adbypass_api}/bypass",
                 json={"url": ads_url},
-                timeout=5
+                timeout=2  # ⚡ SUPER SHORT TIMEOUT
             )
             
             if resp.status_code == 200:
@@ -222,29 +234,19 @@ class LibGenEngine:
             return None
 
     def _build_search_url(self, query: str, page: int) -> str:
-        """Build search URL"""
+        """Build search URL - MINIMAL"""
         query = query.replace(' ', '+')
-        url = f"{self.base_url}/index.php?req={query}"
-        
-        for col in ['t', 'a', 's', 'y', 'p', 'i']:
-            url += f"&columns%5B%5D={col}"
-        for obj in ['f', 'e', 's', 'a', 'p', 'w']:
-            url += f"&objects%5B%5D={obj}"
-        for topic in ['l', 'c', 'f', 'a', 'm', 'r', 's']:
-            url += f"&topics%5B%5D={topic}"
-        url += f"&res=25&filesuns=all&curtab=f&page={page}"
-        
-        return url
+        return f"{self.base_url}/index.php?req={query}&res=25&filesuns=all&curtab=f&page={page}"
 
     def _parse_row(self, row, cells) -> Optional[Dict]:
-        """Parse a row - keep it minimal"""
+        """Parse a row - MINIMAL"""
         try:
-            # Title
+            # Title - quick
             bold = cells[0].find('b')
-            title = bold.get_text(strip=True) if bold else cells[0].get_text(strip=True)[:100]
+            title = bold.get_text(strip=True) if bold else cells[0].get_text(strip=True)[:80]
             title = re.sub(r'^#\d+\s*', '', title)
             
-            # Get MD5 and ads URL
+            # MD5 and ads URL
             md5 = None
             ads_url = None
             
@@ -262,16 +264,15 @@ class LibGenEngine:
                     break
             
             return {
-                'title': title,
-                'author': cells[1].get_text(strip=True) if len(cells) > 1 else "",
-                'publisher': cells[2].get_text(strip=True) if len(cells) > 2 else "",
+                'title': title[:100],
+                'author': cells[1].get_text(strip=True)[:50] if len(cells) > 1 else "",
+                'publisher': cells[2].get_text(strip=True)[:50] if len(cells) > 2 else "",
                 'year': cells[3].get_text(strip=True) if len(cells) > 3 else "",
                 'language': cells[4].get_text(strip=True) if len(cells) > 4 else "",
                 'pages': cells[5].get_text(strip=True) if len(cells) > 5 else "",
                 'size': cells[6].get_text(strip=True) if len(cells) > 6 else "",
                 'extension': cells[7].get_text(strip=True).lower() if len(cells) > 7 else 'unknown',
                 'md5': md5,
-                'ads_url': ads_url,
                 'download_url': None,
                 'bypass_success': False,
                 'is_book': bool(row.find('span', class_='badge', string=re.compile(r'b'))),
@@ -281,41 +282,33 @@ class LibGenEngine:
             return None
 
     def _apply_filters(self, book: Dict, filters: Dict) -> bool:
-        """Minimal filter application"""
+        """Quick filter check"""
         if filters.get('format') and book['extension'] != filters['format']:
             return False
         if filters.get('author') and filters['author'].lower() not in book['author'].lower():
             return False
         if filters.get('language') and book['language'].lower() != filters['language'].lower():
             return False
-        if filters.get('year_from'):
-            try:
-                if book['year'] and int(book['year']) < filters['year_from']:
-                    return False
-            except:
-                pass
-        if filters.get('year_to'):
-            try:
-                if book['year'] and int(book['year']) > filters['year_to']:
-                    return False
-            except:
-                pass
         return True
 
     def get_by_md5(self, md5: str) -> Dict:
-        """Get download URL by MD5 - with cache"""
+        """⚡ Ultra-fast MD5 lookup with cache"""
+        start_time = time.time()
+        
         # Check cache
         cached = cache.get(f"md5:{md5}")
         if cached:
+            cached['_time_taken'] = f"{time.time() - start_time:.2f}s (cached)"
             return cached
         
         ads_url = f"{self.base_url}/ads.php?md5={md5}"
         
         try:
+            # ⚡ 2 second timeout
             resp = self.session.post(
                 f"{self.adbypass_api}/bypass",
                 json={"url": ads_url},
-                timeout=5
+                timeout=2
             )
             
             if resp.status_code == 200:
@@ -325,15 +318,31 @@ class LibGenEngine:
                     if real_url:
                         if real_url.startswith('get.php'):
                             real_url = f"{self.base_url}/{real_url}"
-                        result = {'success': True, 'md5': md5, 'download_url': real_url}
+                        result = {
+                            'success': True,
+                            'md5': md5,
+                            'download_url': real_url
+                        }
                         cache.set(f"md5:{md5}", result)
+                        result['_time_taken'] = f"{time.time() - start_time:.2f}s"
                         return result
             
-            result = {'success': False, 'md5': md5, 'error': 'Could not get download URL'}
+            result = {
+                'success': False,
+                'md5': md5,
+                'error': 'Could not get download URL'
+            }
             cache.set(f"md5:{md5}", result)
+            result['_time_taken'] = f"{time.time() - start_time:.2f}s"
             return result
         except:
-            return {'success': False, 'md5': md5, 'error': 'Request failed'}
+            result = {
+                'success': False,
+                'md5': md5,
+                'error': 'Request timeout'
+            }
+            result['_time_taken'] = f"{time.time() - start_time:.2f}s"
+            return result
 
 
 # ========== INITIALIZE ==========
@@ -347,12 +356,16 @@ engine = LibGenEngine()
 async def root():
     return {
         "name": "LibGen API",
-        "version": "4.0.0",
-        "description": "Fast LibGen search with real download URLs",
+        "version": "5.0.0",
+        "description": "Ultra-fast LibGen search with time tracking",
+        "timeouts": {
+            "page_fetch": "5 seconds",
+            "bypass": "2 seconds",
+            "batch_bypass": "3 seconds"
+        },
         "endpoints": {
-            "/search": "Search with filters",
-            "/download/{md5}": "Get real download URL",
-            "/formats": "Available formats",
+            "/search": "Search with time taken shown",
+            "/download/{md5}": "Get download URL with time taken",
             "/cache/clear": "Clear cache"
         }
     }
@@ -378,26 +391,29 @@ async def search(
     max_pages: int = Query(1, ge=1, le=2),
     format: Optional[str] = None,
     author: Optional[str] = None,
-    language: Optional[str] = None,
-    year_from: Optional[int] = None,
-    year_to: Optional[int] = None
+    language: Optional[str] = None
 ):
-    """Fast search with caching"""
+    """⚡ Ultra-fast search - shows time taken"""
     if not query:
         raise HTTPException(400, "Query required")
+    
+    start_total = time.time()
     
     filters = {
         'format': format,
         'author': author,
         'language': language,
-        'year_from': year_from,
-        'year_to': year_to
     }
     
     try:
         result = engine.search(query, max_pages, filters)
+        
+        total_time = time.time() - start_total
+        
+        # Add time info to response
         return {
             "status": "success",
+            "time_taken": f"{total_time:.2f}s",
             "filters_applied": {k: v for k, v in filters.items() if v},
             "data": result
         }
@@ -407,13 +423,19 @@ async def search(
 
 @app.get("/download/{md5}")
 async def get_download_url(md5: str):
+    """⚡ Ultra-fast MD5 lookup - shows time taken"""
+    start_time = time.time()
+    
     if not md5 or len(md5) != 32:
         raise HTTPException(400, "Invalid MD5 hash")
     
     try:
         result = engine.get_by_md5(md5)
+        total_time = time.time() - start_time
+        
         return {
             "status": "success" if result['success'] else "error",
+            "time_taken": f"{total_time:.2f}s",
             "data": result
         }
     except Exception as e:
