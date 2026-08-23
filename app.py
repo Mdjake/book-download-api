@@ -1,22 +1,24 @@
 """
-LibGen Main API - Optimized for Speed
+LibGen Main API - Optimized with Caching & CORS
 Fast search with real download URLs
 """
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import requests
 from bs4 import BeautifulSoup
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import uvicorn
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import asyncio
+from functools import lru_cache
+from collections import OrderedDict
 
 # ========== FASTAPI APP ==========
 
@@ -26,11 +28,64 @@ app = FastAPI(
     version="3.0.0"
 )
 
+# ========== CORS MIDDLEWARE ==========
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*",  # Allow all origins (you can restrict to specific domains)
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "https://your-frontend-domain.com"
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,  # 24 hours
+)
+
 # ========== CONFIGURATION ==========
 
 ADBYPASS_API = os.environ.get("ADBYPASS_API", "https://libgen-adbypass.vercel.app")
-MAX_WORKERS = 5  # Parallel requests
+MAX_WORKERS = 5
 TIMEOUT = 10
+CACHE_TTL = 3600  # 1 hour cache
+
+# ========== CACHE SYSTEM ==========
+
+class TTLCache:
+    """Time-based cache with TTL"""
+    def __init__(self, max_size=100, ttl=3600):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+        self.ttl = ttl
+    
+    def get(self, key):
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if datetime.now() - timestamp < timedelta(seconds=self.ttl):
+                # Move to end (most recently used)
+                self.cache.move_to_end(key)
+                return value
+            else:
+                del self.cache[key]
+        return None
+    
+    def set(self, key, value):
+        if len(self.cache) >= self.max_size:
+            self.cache.popitem(last=False)  # Remove oldest
+        self.cache[key] = (value, datetime.now())
+    
+    def clear(self):
+        self.cache.clear()
+    
+    def get_size(self):
+        return len(self.cache)
+
+# Initialize cache
+search_cache = TTLCache(max_size=100, ttl=CACHE_TTL)
+md5_cache = TTLCache(max_size=500, ttl=CACHE_TTL)
 
 # ========== LIBGEN ENGINE ==========
 
@@ -48,14 +103,25 @@ class LibGenEngine:
         self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
     def search(self, query: str, max_pages: int = 1, filters: Dict = None) -> Dict:
-        """Fast search with parallel requests"""
+        """Fast search with caching and parallel requests"""
         if filters is None:
             filters = {}
+        
+        # ✅ Generate cache key
+        cache_key = f"search:{query}:{max_pages}:{json.dumps(filters, sort_keys=True)}"
+        
+        # ✅ Check cache
+        cached_result = search_cache.get(cache_key)
+        if cached_result:
+            print(f"✅ Cache hit for: {query}")
+            return cached_result
+        
+        print(f"⏳ Cache miss for: {query}, fetching...")
         
         results = []
         total_available = 0
         
-        # ✅ Fetch all pages in parallel
+        # Fetch all pages in parallel
         with ThreadPoolExecutor(max_workers=max_pages) as executor:
             futures = {
                 executor.submit(self._fetch_page, query, page, filters): page 
@@ -68,13 +134,18 @@ class LibGenEngine:
                     results.extend(page_results)
                     total_available = page_total
         
-        return {
+        result_data = {
             'query': query,
             'total_results': len(results),
             'total_available': total_available,
             'pages_fetched': max_pages,
             'results': results
         }
+        
+        # ✅ Store in cache
+        search_cache.set(cache_key, result_data)
+        
+        return result_data
 
     def _fetch_page(self, query: str, page: int, filters: Dict) -> tuple:
         """Fetch and parse a single page"""
@@ -106,7 +177,7 @@ class LibGenEngine:
             rows = table.find_all('tr')[1:]
             page_results = []
             
-            # ✅ Parse rows and collect ads URLs for batch bypass
+            # Parse rows and collect ads URLs for batch bypass
             books_to_bypass = []
             for row in rows:
                 cells = row.find_all('td')
@@ -124,7 +195,7 @@ class LibGenEngine:
                     else:
                         page_results.append(book)
             
-            # ✅ Batch bypass all ads URLs in parallel
+            # Batch bypass all ads URLs in parallel
             if books_to_bypass:
                 bypass_results = self._batch_bypass([b['ads_url'] for b in books_to_bypass])
                 for book, real_url in zip(books_to_bypass, bypass_results):
@@ -287,7 +358,15 @@ class LibGenEngine:
         return True
 
     def get_by_md5(self, md5: str) -> Dict:
-        """Get real download URL by MD5 hash"""
+        """Get real download URL by MD5 hash with caching"""
+        # ✅ Check MD5 cache
+        cached_result = md5_cache.get(md5)
+        if cached_result:
+            print(f"✅ MD5 cache hit: {md5}")
+            return cached_result
+        
+        print(f"⏳ MD5 cache miss: {md5}, fetching...")
+        
         ads_url = f"{self.base_url}/ads.php?md5={md5}"
         
         try:
@@ -304,24 +383,31 @@ class LibGenEngine:
                     if real_url:
                         if real_url.startswith('get.php'):
                             real_url = f"{self.base_url}/{real_url}"
-                        return {
+                        result = {
                             'success': True,
                             'md5': md5,
                             'download_url': real_url
                         }
+                        # ✅ Store in cache
+                        md5_cache.set(md5, result)
+                        return result
             
-            return {
+            result = {
                 'success': False,
                 'md5': md5,
                 'error': 'Could not get download URL'
             }
+            # ✅ Cache failed results too (short TTL)
+            md5_cache.set(md5, result)
+            return result
             
         except Exception as e:
-            return {
+            result = {
                 'success': False,
                 'md5': md5,
                 'error': str(e)
             }
+            return result
 
 
 # ========== INITIALIZE ==========
@@ -337,10 +423,16 @@ async def root():
         "name": "LibGen Main API",
         "version": "3.0.0",
         "description": "Fast LibGen search with real download URLs",
+        "cache_status": {
+            "search_cache_size": search_cache.get_size(),
+            "md5_cache_size": md5_cache.get_size(),
+            "cache_ttl": f"{CACHE_TTL} seconds"
+        },
         "endpoints": {
             "/search": "GET - Fast search with filters",
             "/download/{md5}": "GET - Get real download URL by MD5",
-            "/formats": "GET - Available formats"
+            "/formats": "GET - Available formats",
+            "/cache/clear": "POST - Clear all cache"
         },
         "example": "/search?query=think+and+grow+rich&format=pdf&max_pages=1"
     }
@@ -348,7 +440,26 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "cache": {
+            "search_cache_size": search_cache.get_size(),
+            "md5_cache_size": md5_cache.get_size()
+        }
+    }
+
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """Clear all cached data"""
+    search_cache.clear()
+    md5_cache.clear()
+    return {
+        "status": "success",
+        "message": "All cache cleared",
+        "timestamp": datetime.now().isoformat()
+    }
 
 
 @app.get("/search")
@@ -361,7 +472,7 @@ async def search(
     year_from: Optional[int] = Query(None, description="Year from"),
     year_to: Optional[int] = Query(None, description="Year to")
 ):
-    """⚡ Fast search with real download URLs"""
+    """⚡ Fast search with real download URLs and caching"""
     if not query:
         raise HTTPException(status_code=400, detail="Query parameter is required")
     
@@ -378,6 +489,10 @@ async def search(
         return {
             "status": "success",
             "filters_applied": {k: v for k, v in filters.items() if v is not None},
+            "cache_info": {
+                "search_cache_size": search_cache.get_size(),
+                "md5_cache_size": md5_cache.get_size()
+            },
             "data": result
         }
     except Exception as e:
@@ -386,7 +501,7 @@ async def search(
 
 @app.get("/download/{md5}")
 async def get_download_url(md5: str):
-    """⚡ Get real download URL by MD5"""
+    """⚡ Get real download URL by MD5 with caching"""
     if not md5 or len(md5) != 32:
         raise HTTPException(status_code=400, detail="Invalid MD5 hash")
     
@@ -394,6 +509,10 @@ async def get_download_url(md5: str):
         result = engine.get_by_md5(md5)
         return {
             "status": "success" if result['success'] else "error",
+            "cache_info": {
+                "search_cache_size": search_cache.get_size(),
+                "md5_cache_size": md5_cache.get_size()
+            },
             "data": result
         }
     except Exception as e:
