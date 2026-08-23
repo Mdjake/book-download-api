@@ -1,6 +1,6 @@
 """
-LibGen Main API - Ad Links Hidden
-Only shows real download URLs, no ads.php links
+LibGen Main API - Optimized for Speed
+Fast search with real download URLs
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -15,18 +15,22 @@ from datetime import datetime
 import uvicorn
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 
 # ========== FASTAPI APP ==========
 
 app = FastAPI(
     title="LibGen Main API",
-    description="Search LibGen and get real download URLs (no ads shown)",
-    version="2.0.0"
+    description="Fast LibGen search with real download URLs",
+    version="3.0.0"
 )
 
 # ========== CONFIGURATION ==========
 
 ADBYPASS_API = os.environ.get("ADBYPASS_API", "https://libgen-adbypass.vercel.app")
+MAX_WORKERS = 5  # Parallel requests
+TIMEOUT = 10
 
 # ========== LIBGEN ENGINE ==========
 
@@ -35,80 +39,34 @@ class LibGenEngine:
         self.base_url = "https://libgen.li"
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'DNT': '1',
+            'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
         })
         self.adbypass_api = ADBYPASS_API
+        self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
     def search(self, query: str, max_pages: int = 1, filters: Dict = None) -> Dict:
-        """Search LibGen and get ONLY real download URLs"""
+        """Fast search with parallel requests"""
         if filters is None:
             filters = {}
         
         results = []
         total_available = 0
         
-        for page in range(1, max_pages + 1):
-            url = self._build_search_url(query, page)
+        # ✅ Fetch all pages in parallel
+        with ThreadPoolExecutor(max_workers=max_pages) as executor:
+            futures = {
+                executor.submit(self._fetch_page, query, page, filters): page 
+                for page in range(1, max_pages + 1)
+            }
             
-            try:
-                response = self.session.get(url, timeout=30)
-                
-                if response.status_code != 200:
-                    continue
-                
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Get total count
-                files_tab = soup.find('a', href=re.compile(r'curtab=f'))
-                if files_tab:
-                    badge = files_tab.find('span', class_='badge')
-                    if badge:
-                        try:
-                            total_available = int(badge.get_text(strip=True))
-                        except:
-                            pass
-                
-                # Parse table
-                table = soup.find('table', {'id': 'tablelibgen'})
-                if not table:
-                    continue
-                
-                rows = table.find_all('tr')[1:]
-                
-                for row in rows:
-                    cells = row.find_all('td')
-                    if len(cells) < 8:
-                        continue
-                    
-                    book = self._parse_row(row, cells)
-                    if book:
-                        # Apply filters
-                        if not self._apply_filters(book, filters):
-                            continue
-                        
-                        # ✅ Get real download URL via AdBypass API
-                        if book.get('ads_url'):
-                            real_url = self._get_real_url(book['ads_url'])
-                            if real_url:
-                                # ✅ ONLY store the real URL - hide ads_url
-                                book['download_url'] = real_url
-                                book['bypass_success'] = True
-                            else:
-                                book['bypass_success'] = False
-                        
-                        # ✅ Remove ads_url from response
-                        book.pop('ads_url', None)
-                        
-                        results.append(book)
-                
-            except Exception as e:
-                continue
-            
-            time.sleep(0.3)
+            for future in as_completed(futures):
+                page_results, page_total = future.result()
+                if page_results:
+                    results.extend(page_results)
+                    total_available = page_total
         
         return {
             'query': query,
@@ -118,13 +76,90 @@ class LibGenEngine:
             'results': results
         }
 
+    def _fetch_page(self, query: str, page: int, filters: Dict) -> tuple:
+        """Fetch and parse a single page"""
+        try:
+            url = self._build_search_url(query, page)
+            response = self.session.get(url, timeout=TIMEOUT)
+            
+            if response.status_code != 200:
+                return [], 0
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Get total count
+            total_available = 0
+            files_tab = soup.find('a', href=re.compile(r'curtab=f'))
+            if files_tab:
+                badge = files_tab.find('span', class_='badge')
+                if badge:
+                    try:
+                        total_available = int(badge.get_text(strip=True))
+                    except:
+                        pass
+            
+            # Parse table
+            table = soup.find('table', {'id': 'tablelibgen'})
+            if not table:
+                return [], total_available
+            
+            rows = table.find_all('tr')[1:]
+            page_results = []
+            
+            # ✅ Parse rows and collect ads URLs for batch bypass
+            books_to_bypass = []
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) < 8:
+                    continue
+                
+                book = self._parse_row(row, cells)
+                if book:
+                    # Apply filters
+                    if not self._apply_filters(book, filters):
+                        continue
+                    
+                    if book.get('ads_url'):
+                        books_to_bypass.append(book)
+                    else:
+                        page_results.append(book)
+            
+            # ✅ Batch bypass all ads URLs in parallel
+            if books_to_bypass:
+                bypass_results = self._batch_bypass([b['ads_url'] for b in books_to_bypass])
+                for book, real_url in zip(books_to_bypass, bypass_results):
+                    if real_url:
+                        book['download_url'] = real_url
+                        book['bypass_success'] = True
+                    else:
+                        book['bypass_success'] = False
+                    book.pop('ads_url', None)
+                    page_results.append(book)
+            
+            return page_results, total_available
+            
+        except Exception:
+            return [], 0
+
+    def _batch_bypass(self, ads_urls: List[str]) -> List[Optional[str]]:
+        """Bypass multiple ads URLs in parallel"""
+        if not ads_urls:
+            return []
+        
+        with ThreadPoolExecutor(max_workers=min(len(ads_urls), MAX_WORKERS)) as executor:
+            futures = {executor.submit(self._get_real_url, url): url for url in ads_urls}
+            results = []
+            for future in as_completed(futures):
+                results.append(future.result())
+            return results
+
     def _get_real_url(self, ads_url: str) -> Optional[str]:
         """Get real download URL from AdBypass API"""
         try:
             response = self.session.post(
                 f"{self.adbypass_api}/bypass",
                 json={"url": ads_url},
-                timeout=10
+                timeout=8
             )
             
             if response.status_code == 200:
@@ -135,9 +170,7 @@ class LibGenEngine:
                         if real_url.startswith('get.php'):
                             return f"{self.base_url}/{real_url}"
                         return real_url
-            
             return None
-            
         except Exception:
             return None
 
@@ -161,7 +194,7 @@ class LibGenEngine:
         return url
 
     def _parse_row(self, row, cells) -> Optional[Dict]:
-        """Parse a row - stores ads_url internally but won't show it"""
+        """Parse a row"""
         try:
             # Title
             bold_tag = cells[0].find('b')
@@ -180,7 +213,7 @@ class LibGenEngine:
             size = cells[6].get_text(strip=True) if len(cells) > 6 else ""
             extension = cells[7].get_text(strip=True) if len(cells) > 7 else ""
             
-            # Extract MD5 and ads URL (internal use only)
+            # Extract MD5 and ads URL
             md5 = None
             ads_url = None
             
@@ -213,8 +246,8 @@ class LibGenEngine:
                 'size': size,
                 'extension': extension.lower() if extension else 'unknown',
                 'md5': md5,
-                'ads_url': ads_url,  # Internal use only - will be removed
-                'download_url': None,  # Will be filled with real URL
+                'ads_url': ads_url,
+                'download_url': None,
                 'bypass_success': False,
                 'is_book': is_book,
                 'is_comic': is_comic
@@ -254,14 +287,14 @@ class LibGenEngine:
         return True
 
     def get_by_md5(self, md5: str) -> Dict:
-        """Get ONLY the real download URL by MD5 hash"""
+        """Get real download URL by MD5 hash"""
         ads_url = f"{self.base_url}/ads.php?md5={md5}"
         
         try:
             response = self.session.post(
                 f"{self.adbypass_api}/bypass",
                 json={"url": ads_url},
-                timeout=10
+                timeout=8
             )
             
             if response.status_code == 200:
@@ -274,7 +307,7 @@ class LibGenEngine:
                         return {
                             'success': True,
                             'md5': md5,
-                            'download_url': real_url  # ✅ Only the real URL
+                            'download_url': real_url
                         }
             
             return {
@@ -300,32 +333,22 @@ engine = LibGenEngine()
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "name": "LibGen Main API",
-        "version": "2.0.0",
-        "description": "Search LibGen and get real download URLs (no ads shown)",
+        "version": "3.0.0",
+        "description": "Fast LibGen search with real download URLs",
         "endpoints": {
-            "/": "This info",
-            "/health": "Health check",
-            "/search": "GET - Search with filters",
-            "/search/advanced": "GET - Advanced search",
-            "/download/{md5}": "GET - Get real download URL by MD5"
+            "/search": "GET - Fast search with filters",
+            "/download/{md5}": "GET - Get real download URL by MD5",
+            "/formats": "GET - Available formats"
         },
-        "example": {
-            "search": "/search?query=think+and+grow+rich&format=pdf",
-            "download": "/download/7af72ce2093bbfcb7909ac887fce9ff0"
-        }
+        "example": "/search?query=think+and+grow+rich&format=pdf&max_pages=1"
     }
 
 
 @app.get("/health")
 async def health():
-    """Health check"""
-    return {
-        "status": "ok",
-        "timestamp": datetime.now().isoformat()
-    }
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
 @app.get("/search")
@@ -338,11 +361,7 @@ async def search(
     year_from: Optional[int] = Query(None, description="Year from"),
     year_to: Optional[int] = Query(None, description="Year to")
 ):
-    """
-    ⚡ Search - Returns ONLY real download URLs (no ads links)
-    
-    Example: /search?query=think+and+grow+rich&format=pdf
-    """
+    """⚡ Fast search with real download URLs"""
     if not query:
         raise HTTPException(status_code=400, detail="Query parameter is required")
     
@@ -365,52 +384,9 @@ async def search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/search/advanced")
-async def search_advanced(
-    query: str = Query(..., description="Search term"),
-    max_pages: int = Query(1, ge=1, le=3),
-    format: Optional[str] = None,
-    author: Optional[str] = None,
-    language: Optional[str] = None,
-    year_from: Optional[int] = None,
-    year_to: Optional[int] = None,
-    publisher: Optional[str] = None
-):
-    """
-    Advanced search - Returns ONLY real download URLs
-    
-    Example: /search/advanced?query=think+and+grow+rich&author=Napoleon+Hill&format=pdf
-    """
-    if not query:
-        raise HTTPException(status_code=400, detail="Query parameter is required")
-    
-    filters = {
-        'format': format,
-        'author': author,
-        'language': language,
-        'year_from': year_from,
-        'year_to': year_to,
-        'publisher': publisher
-    }
-    
-    try:
-        result = engine.search(query, max_pages, filters)
-        return {
-            "status": "success",
-            "filters_applied": {k: v for k, v in filters.items() if v is not None},
-            "data": result
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/download/{md5}")
 async def get_download_url(md5: str):
-    """
-    ⚡ Get ONLY the real download URL by MD5 (no ads link shown)
-    
-    Example: /download/7af72ce2093bbfcb7909ac887fce9ff0
-    """
+    """⚡ Get real download URL by MD5"""
     if not md5 or len(md5) != 32:
         raise HTTPException(status_code=400, detail="Invalid MD5 hash")
     
@@ -426,7 +402,6 @@ async def get_download_url(md5: str):
 
 @app.get("/formats")
 async def get_formats():
-    """Get available formats"""
     return {
         "formats": {
             "pdf": "PDF Documents",
