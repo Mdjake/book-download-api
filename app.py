@@ -1,12 +1,10 @@
 """
-LibGen Main API - Optimized with Caching & CORS
-Fast search with real download URLs
+LibGen Main API - Lightning Fast
+Optimized with aggressive caching and minimal requests
 """
 
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import requests
 from bs4 import BeautifulSoup
@@ -15,77 +13,57 @@ import json
 from datetime import datetime, timedelta
 import uvicorn
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-from collections import OrderedDict
 
 # ========== FASTAPI APP ==========
 
 app = FastAPI(
     title="LibGen Main API",
-    description="Fast LibGen search with real download URLs",
-    version="3.0.0"
+    version="4.0.0"
 )
 
-# ========== CORS MIDDLEWARE ==========
+# ========== CORS ==========
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",  # Allow all origins (you can restrict to specific domains)
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "https://your-frontend-domain.com"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=86400,  # 24 hours
 )
 
 # ========== CONFIGURATION ==========
 
 ADBYPASS_API = os.environ.get("ADBYPASS_API", "https://libgen-adbypass.vercel.app")
-MAX_WORKERS = 5
-TIMEOUT = 10
-CACHE_TTL = 3600  # 1 hour cache
+MAX_WORKERS = 10
+TIMEOUT = 8
+CACHE_TTL = 7200  # 2 hours
 
-# ========== CACHE SYSTEM ==========
+# ========== SIMPLE CACHE ==========
 
-class TTLCache:
-    """Time-based cache with TTL"""
-    def __init__(self, max_size=100, ttl=3600):
-        self.cache = OrderedDict()
-        self.max_size = max_size
-        self.ttl = ttl
+class SimpleCache:
+    def __init__(self):
+        self.data = {}
+        self.timestamps = {}
     
     def get(self, key):
-        if key in self.cache:
-            value, timestamp = self.cache[key]
-            if datetime.now() - timestamp < timedelta(seconds=self.ttl):
-                # Move to end (most recently used)
-                self.cache.move_to_end(key)
-                return value
+        if key in self.data:
+            if datetime.now() - self.timestamps[key] < timedelta(seconds=CACHE_TTL):
+                return self.data[key]
             else:
-                del self.cache[key]
+                del self.data[key]
+                del self.timestamps[key]
         return None
     
     def set(self, key, value):
-        if len(self.cache) >= self.max_size:
-            self.cache.popitem(last=False)  # Remove oldest
-        self.cache[key] = (value, datetime.now())
+        self.data[key] = value
+        self.timestamps[key] = datetime.now()
     
     def clear(self):
-        self.cache.clear()
-    
-    def get_size(self):
-        return len(self.cache)
+        self.data.clear()
+        self.timestamps.clear()
 
-# Initialize cache
-search_cache = TTLCache(max_size=100, ttl=CACHE_TTL)
-md5_cache = TTLCache(max_size=500, ttl=CACHE_TTL)
+cache = SimpleCache()
 
 # ========== LIBGEN ENGINE ==========
 
@@ -95,46 +73,44 @@ class LibGenEngine:
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
             'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
         })
         self.adbypass_api = ADBYPASS_API
-        self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
     def search(self, query: str, max_pages: int = 1, filters: Dict = None) -> Dict:
-        """Fast search with caching and parallel requests"""
+        """Fast search with minimal overhead"""
         if filters is None:
             filters = {}
         
-        # ✅ Generate cache key
-        cache_key = f"search:{query}:{max_pages}:{json.dumps(filters, sort_keys=True)}"
+        # Generate cache key
+        cache_key = f"{query}:{max_pages}:{json.dumps(filters, sort_keys=True)}"
         
-        # ✅ Check cache
-        cached_result = search_cache.get(cache_key)
-        if cached_result:
-            print(f"✅ Cache hit for: {query}")
-            return cached_result
+        # Check cache
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
         
-        print(f"⏳ Cache miss for: {query}, fetching...")
-        
+        # Fetch pages in parallel
         results = []
         total_available = 0
         
-        # Fetch all pages in parallel
         with ThreadPoolExecutor(max_workers=max_pages) as executor:
-            futures = {
-                executor.submit(self._fetch_page, query, page, filters): page 
+            futures = [
+                executor.submit(self._fetch_page, query, page, filters) 
                 for page in range(1, max_pages + 1)
-            }
+            ]
             
             for future in as_completed(futures):
                 page_results, page_total = future.result()
                 if page_results:
                     results.extend(page_results)
-                    total_available = page_total
+                    if page_total:
+                        total_available = page_total
         
-        result_data = {
+        # Format response
+        response = {
             'query': query,
             'total_results': len(results),
             'total_available': total_available,
@@ -142,10 +118,9 @@ class LibGenEngine:
             'results': results
         }
         
-        # ✅ Store in cache
-        search_cache.set(cache_key, result_data)
-        
-        return result_data
+        # Cache
+        cache.set(cache_key, response)
+        return response
 
     def _fetch_page(self, query: str, page: int, filters: Dict) -> tuple:
         """Fetch and parse a single page"""
@@ -169,36 +144,33 @@ class LibGenEngine:
                     except:
                         pass
             
-            # Parse table
             table = soup.find('table', {'id': 'tablelibgen'})
             if not table:
                 return [], total_available
             
             rows = table.find_all('tr')[1:]
             page_results = []
+            ads_urls = []
+            ads_books = []
             
-            # Parse rows and collect ads URLs for batch bypass
-            books_to_bypass = []
+            # Parse rows first
             for row in rows:
                 cells = row.find_all('td')
                 if len(cells) < 8:
                     continue
                 
                 book = self._parse_row(row, cells)
-                if book:
-                    # Apply filters
-                    if not self._apply_filters(book, filters):
-                        continue
-                    
+                if book and self._apply_filters(book, filters):
                     if book.get('ads_url'):
-                        books_to_bypass.append(book)
+                        ads_urls.append(book['ads_url'])
+                        ads_books.append(book)
                     else:
                         page_results.append(book)
             
-            # Batch bypass all ads URLs in parallel
-            if books_to_bypass:
-                bypass_results = self._batch_bypass([b['ads_url'] for b in books_to_bypass])
-                for book, real_url in zip(books_to_bypass, bypass_results):
+            # Batch bypass all ads URLs at once
+            if ads_urls:
+                real_urls = self._batch_bypass(ads_urls)
+                for book, real_url in zip(ads_books, real_urls):
                     if real_url:
                         book['download_url'] = real_url
                         book['bypass_success'] = True
@@ -209,90 +181,76 @@ class LibGenEngine:
             
             return page_results, total_available
             
-        except Exception:
+        except Exception as e:
             return [], 0
 
     def _batch_bypass(self, ads_urls: List[str]) -> List[Optional[str]]:
-        """Bypass multiple ads URLs in parallel"""
+        """Parallel batch bypass"""
         if not ads_urls:
             return []
         
-        with ThreadPoolExecutor(max_workers=min(len(ads_urls), MAX_WORKERS)) as executor:
-            futures = {executor.submit(self._get_real_url, url): url for url in ads_urls}
+        # Limit workers to avoid rate limiting
+        workers = min(len(ads_urls), 5)
+        
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(self._bypass_single, url): url for url in ads_urls}
             results = []
             for future in as_completed(futures):
                 results.append(future.result())
             return results
 
-    def _get_real_url(self, ads_url: str) -> Optional[str]:
-        """Get real download URL from AdBypass API"""
+    def _bypass_single(self, ads_url: str) -> Optional[str]:
+        """Single URL bypass with timeout"""
         try:
-            response = self.session.post(
+            # Quick request to AdBypass API
+            resp = self.session.post(
                 f"{self.adbypass_api}/bypass",
                 json={"url": ads_url},
-                timeout=8
+                timeout=5
             )
             
-            if response.status_code == 200:
-                data = response.json()
+            if resp.status_code == 200:
+                data = resp.json()
                 if data.get('status') == 'success':
-                    real_url = data.get('data', {}).get('real_url')
-                    if real_url:
-                        if real_url.startswith('get.php'):
-                            return f"{self.base_url}/{real_url}"
-                        return real_url
+                    real = data.get('data', {}).get('real_url')
+                    if real:
+                        if real.startswith('get.php'):
+                            return f"{self.base_url}/{real}"
+                        return real
             return None
-        except Exception:
+        except:
             return None
 
     def _build_search_url(self, query: str, page: int) -> str:
         """Build search URL"""
         query = query.replace(' ', '+')
-        
         url = f"{self.base_url}/index.php?req={query}"
         
         for col in ['t', 'a', 's', 'y', 'p', 'i']:
             url += f"&columns%5B%5D={col}"
-        
         for obj in ['f', 'e', 's', 'a', 'p', 'w']:
             url += f"&objects%5B%5D={obj}"
-        
         for topic in ['l', 'c', 'f', 'a', 'm', 'r', 's']:
             url += f"&topics%5B%5D={topic}"
-        
         url += f"&res=25&filesuns=all&curtab=f&page={page}"
         
         return url
 
     def _parse_row(self, row, cells) -> Optional[Dict]:
-        """Parse a row"""
+        """Parse a row - keep it minimal"""
         try:
             # Title
-            bold_tag = cells[0].find('b')
-            if bold_tag:
-                title = bold_tag.get_text(strip=True)
-                title = re.sub(r'^#\d+\s*', '', title)
-            else:
-                title = cells[0].get_text(strip=True)[:100]
+            bold = cells[0].find('b')
+            title = bold.get_text(strip=True) if bold else cells[0].get_text(strip=True)[:100]
+            title = re.sub(r'^#\d+\s*', '', title)
             
-            # Other fields
-            author = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-            publisher = cells[2].get_text(strip=True) if len(cells) > 2 else ""
-            year = cells[3].get_text(strip=True) if len(cells) > 3 else ""
-            language = cells[4].get_text(strip=True) if len(cells) > 4 else ""
-            pages = cells[5].get_text(strip=True) if len(cells) > 5 else ""
-            size = cells[6].get_text(strip=True) if len(cells) > 6 else ""
-            extension = cells[7].get_text(strip=True) if len(cells) > 7 else ""
-            
-            # Extract MD5 and ads URL
+            # Get MD5 and ads URL
             md5 = None
             ads_url = None
             
             for cell in cells:
-                links = cell.find_all('a')
-                for link in links:
+                for link in cell.find_all('a'):
                     href = link.get('href', '')
-                    
                     if 'ads.php?md5=' in href or 'get.php?md5=' in href:
                         match = re.search(r'md5=([a-f0-9]{32})', href)
                         if match:
@@ -300,114 +258,82 @@ class LibGenEngine:
                             if 'ads.php' in href:
                                 ads_url = f"{self.base_url}{href}"
                             break
-                
                 if md5:
                     break
             
-            is_book = bool(row.find('span', class_='badge', string=re.compile(r'b')))
-            is_comic = bool(row.find('span', class_='badge', string=re.compile(r'c')))
-            
             return {
                 'title': title,
-                'author': author,
-                'publisher': publisher,
-                'year': year,
-                'language': language,
-                'pages': pages,
-                'size': size,
-                'extension': extension.lower() if extension else 'unknown',
+                'author': cells[1].get_text(strip=True) if len(cells) > 1 else "",
+                'publisher': cells[2].get_text(strip=True) if len(cells) > 2 else "",
+                'year': cells[3].get_text(strip=True) if len(cells) > 3 else "",
+                'language': cells[4].get_text(strip=True) if len(cells) > 4 else "",
+                'pages': cells[5].get_text(strip=True) if len(cells) > 5 else "",
+                'size': cells[6].get_text(strip=True) if len(cells) > 6 else "",
+                'extension': cells[7].get_text(strip=True).lower() if len(cells) > 7 else 'unknown',
                 'md5': md5,
                 'ads_url': ads_url,
                 'download_url': None,
                 'bypass_success': False,
-                'is_book': is_book,
-                'is_comic': is_comic
+                'is_book': bool(row.find('span', class_='badge', string=re.compile(r'b'))),
+                'is_comic': bool(row.find('span', class_='badge', string=re.compile(r'c')))
             }
-            
-        except Exception:
+        except:
             return None
 
     def _apply_filters(self, book: Dict, filters: Dict) -> bool:
-        """Apply filters"""
-        if filters.get('format') and filters['format'] != 'all':
-            if book['extension'] != filters['format']:
-                return False
-        
-        if filters.get('author'):
-            if filters['author'].lower() not in book['author'].lower():
-                return False
-        
-        if filters.get('language') and filters['language'] != 'all':
-            if book['language'].lower() != filters['language'].lower():
-                return False
-        
+        """Minimal filter application"""
+        if filters.get('format') and book['extension'] != filters['format']:
+            return False
+        if filters.get('author') and filters['author'].lower() not in book['author'].lower():
+            return False
+        if filters.get('language') and book['language'].lower() != filters['language'].lower():
+            return False
         if filters.get('year_from'):
             try:
                 if book['year'] and int(book['year']) < filters['year_from']:
                     return False
             except:
                 pass
-        
         if filters.get('year_to'):
             try:
                 if book['year'] and int(book['year']) > filters['year_to']:
                     return False
             except:
                 pass
-        
         return True
 
     def get_by_md5(self, md5: str) -> Dict:
-        """Get real download URL by MD5 hash with caching"""
-        # ✅ Check MD5 cache
-        cached_result = md5_cache.get(md5)
-        if cached_result:
-            print(f"✅ MD5 cache hit: {md5}")
-            return cached_result
-        
-        print(f"⏳ MD5 cache miss: {md5}, fetching...")
+        """Get download URL by MD5 - with cache"""
+        # Check cache
+        cached = cache.get(f"md5:{md5}")
+        if cached:
+            return cached
         
         ads_url = f"{self.base_url}/ads.php?md5={md5}"
         
         try:
-            response = self.session.post(
+            resp = self.session.post(
                 f"{self.adbypass_api}/bypass",
                 json={"url": ads_url},
-                timeout=8
+                timeout=5
             )
             
-            if response.status_code == 200:
-                data = response.json()
+            if resp.status_code == 200:
+                data = resp.json()
                 if data.get('status') == 'success':
                     real_url = data.get('data', {}).get('real_url')
                     if real_url:
                         if real_url.startswith('get.php'):
                             real_url = f"{self.base_url}/{real_url}"
-                        result = {
-                            'success': True,
-                            'md5': md5,
-                            'download_url': real_url
-                        }
-                        # ✅ Store in cache
-                        md5_cache.set(md5, result)
+                        result = {'success': True, 'md5': md5, 'download_url': real_url}
+                        cache.set(f"md5:{md5}", result)
                         return result
             
-            result = {
-                'success': False,
-                'md5': md5,
-                'error': 'Could not get download URL'
-            }
-            # ✅ Cache failed results too (short TTL)
-            md5_cache.set(md5, result)
+            result = {'success': False, 'md5': md5, 'error': 'Could not get download URL'}
+            cache.set(f"md5:{md5}", result)
             return result
-            
-        except Exception as e:
-            result = {
-                'success': False,
-                'md5': md5,
-                'error': str(e)
-            }
-            return result
+        except:
+            return {'success': False, 'md5': md5, 'error': 'Request failed'}
 
 
 # ========== INITIALIZE ==========
@@ -420,21 +346,15 @@ engine = LibGenEngine()
 @app.get("/")
 async def root():
     return {
-        "name": "LibGen Main API",
-        "version": "3.0.0",
+        "name": "LibGen API",
+        "version": "4.0.0",
         "description": "Fast LibGen search with real download URLs",
-        "cache_status": {
-            "search_cache_size": search_cache.get_size(),
-            "md5_cache_size": md5_cache.get_size(),
-            "cache_ttl": f"{CACHE_TTL} seconds"
-        },
         "endpoints": {
-            "/search": "GET - Fast search with filters",
-            "/download/{md5}": "GET - Get real download URL by MD5",
-            "/formats": "GET - Available formats",
-            "/cache/clear": "POST - Clear all cache"
-        },
-        "example": "/search?query=think+and+grow+rich&format=pdf&max_pages=1"
+            "/search": "Search with filters",
+            "/download/{md5}": "Get real download URL",
+            "/formats": "Available formats",
+            "/cache/clear": "Clear cache"
+        }
     }
 
 
@@ -442,39 +362,29 @@ async def root():
 async def health():
     return {
         "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "cache": {
-            "search_cache_size": search_cache.get_size(),
-            "md5_cache_size": md5_cache.get_size()
-        }
+        "timestamp": datetime.now().isoformat()
     }
 
 
 @app.post("/cache/clear")
 async def clear_cache():
-    """Clear all cached data"""
-    search_cache.clear()
-    md5_cache.clear()
-    return {
-        "status": "success",
-        "message": "All cache cleared",
-        "timestamp": datetime.now().isoformat()
-    }
+    cache.clear()
+    return {"status": "success", "message": "Cache cleared"}
 
 
 @app.get("/search")
 async def search(
-    query: str = Query(..., description="Search term"),
-    max_pages: int = Query(1, ge=1, le=3, description="Number of pages"),
-    format: Optional[str] = Query(None, description="Filter by format"),
-    author: Optional[str] = Query(None, description="Filter by author"),
-    language: Optional[str] = Query(None, description="Filter by language"),
-    year_from: Optional[int] = Query(None, description="Year from"),
-    year_to: Optional[int] = Query(None, description="Year to")
+    query: str = Query(...),
+    max_pages: int = Query(1, ge=1, le=2),
+    format: Optional[str] = None,
+    author: Optional[str] = None,
+    language: Optional[str] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None
 ):
-    """⚡ Fast search with real download URLs and caching"""
+    """Fast search with caching"""
     if not query:
-        raise HTTPException(status_code=400, detail="Query parameter is required")
+        raise HTTPException(400, "Query required")
     
     filters = {
         'format': format,
@@ -488,61 +398,42 @@ async def search(
         result = engine.search(query, max_pages, filters)
         return {
             "status": "success",
-            "filters_applied": {k: v for k, v in filters.items() if v is not None},
-            "cache_info": {
-                "search_cache_size": search_cache.get_size(),
-                "md5_cache_size": md5_cache.get_size()
-            },
+            "filters_applied": {k: v for k, v in filters.items() if v},
             "data": result
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
 
 @app.get("/download/{md5}")
 async def get_download_url(md5: str):
-    """⚡ Get real download URL by MD5 with caching"""
     if not md5 or len(md5) != 32:
-        raise HTTPException(status_code=400, detail="Invalid MD5 hash")
+        raise HTTPException(400, "Invalid MD5 hash")
     
     try:
         result = engine.get_by_md5(md5)
         return {
             "status": "success" if result['success'] else "error",
-            "cache_info": {
-                "search_cache_size": search_cache.get_size(),
-                "md5_cache_size": md5_cache.get_size()
-            },
             "data": result
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
 
 @app.get("/formats")
 async def get_formats():
     return {
         "formats": {
-            "pdf": "PDF Documents",
-            "epub": "EPUB E-books",
-            "mobi": "Mobi (Kindle)",
-            "azw3": "AZW3 (Kindle)",
-            "djvu": "DJVU Scanned",
-            "doc": "Word Documents",
-            "docx": "Word Documents",
-            "txt": "Plain Text",
-            "rtf": "Rich Text",
-            "fb2": "FictionBook",
-            "cbr": "Comic Book (RAR)",
-            "cbz": "Comic Book (ZIP)"
-        },
-        "languages": {
-            "en": "English",
-            "ru": "Russian",
-            "fr": "French",
-            "de": "German",
-            "es": "Spanish",
-            "all": "All Languages"
+            "pdf": "PDF",
+            "epub": "EPUB",
+            "mobi": "MOBI",
+            "azw3": "AZW3",
+            "djvu": "DJVU",
+            "doc": "DOC",
+            "txt": "TXT",
+            "fb2": "FB2",
+            "cbr": "CBR",
+            "cbz": "CBZ"
         }
     }
 
@@ -550,9 +441,4 @@ async def get_formats():
 # ========== RUN ==========
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
