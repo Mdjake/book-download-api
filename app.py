@@ -1,6 +1,6 @@
 """
-LibGen Main API - Final Version
-Supports 'limit' parameter to control number of results
+LibGen Main API - FINAL WORKING VERSION
+Search with results limit + working download links
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -20,8 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = FastAPI(
     title="LibGen Main API",
-    version="8.0.0",
-    description="Search LibGen with results limit control"
+    version="9.0.0"
 )
 
 # ========== CORS ==========
@@ -41,7 +40,7 @@ MAX_WORKERS = 8
 TIMEOUT = 4
 CACHE_TTL = 7200
 
-# ========== SIMPLE CACHE ==========
+# ========== CACHE ==========
 
 class SimpleCache:
     def __init__(self):
@@ -82,13 +81,12 @@ class LibGenEngine:
         self.adbypass_api = ADBYPASS_API
 
     def search(self, query: str, max_pages: int = 1, limit: int = 25, filters: Dict = None) -> Dict:
-        """Fast search with results limit"""
         start_time = time.time()
         
         if filters is None:
             filters = {}
         
-        # Check cache
+        # Cache key
         cache_key = f"{query}:{max_pages}:{limit}:{json.dumps(filters, sort_keys=True)}"
         cached = cache.get(cache_key)
         if cached:
@@ -96,11 +94,11 @@ class LibGenEngine:
             cached['_time_taken'] = f"{elapsed:.2f}s (cached)"
             return cached
         
-        results = []
+        all_results = []
         total_available = 0
         pages_fetched = 0
         
-        # Fetch pages in parallel until we have enough results or run out of pages
+        # Fetch pages
         with ThreadPoolExecutor(max_workers=max_pages) as executor:
             futures = [
                 executor.submit(self._fetch_page, query, page, filters) 
@@ -111,14 +109,12 @@ class LibGenEngine:
                 try:
                     page_results, page_total = future.result(timeout=TIMEOUT)
                     if page_results:
-                        results.extend(page_results)
+                        all_results.extend(page_results)
                         if page_total:
                             total_available = page_total
                         pages_fetched += 1
                         
-                        # Stop if we have enough results
-                        if len(results) >= limit:
-                            # Cancel remaining futures
+                        if len(all_results) >= limit:
                             for f in futures:
                                 if not f.done():
                                     f.cancel()
@@ -126,17 +122,16 @@ class LibGenEngine:
                 except:
                     pass
         
-        # Trim results to limit
-        results = results[:limit]
+        # ✅ FIX: Limit results but keep ALL metadata including download_url
+        limited_results = all_results[:limit]
         
-        # Format response
         response = {
             'query': query,
-            'total_results': len(results),
+            'total_results': len(limited_results),
             'total_available': total_available,
             'pages_fetched': pages_fetched,
             'limit_applied': limit,
-            'results': results
+            'results': limited_results
         }
         
         cache.set(cache_key, response)
@@ -147,7 +142,6 @@ class LibGenEngine:
         return response
 
     def _fetch_page(self, query: str, page: int, filters: Dict) -> tuple:
-        """Fetch a single page"""
         try:
             url = self._build_search_url(query, page)
             response = self.session.get(url, timeout=TIMEOUT)
@@ -157,7 +151,6 @@ class LibGenEngine:
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Get total count
             total_available = 0
             files_tab = soup.find('a', href=re.compile(r'curtab=f'))
             if files_tab:
@@ -177,7 +170,6 @@ class LibGenEngine:
             ads_urls = []
             ads_books = []
             
-            # Parse rows
             for row in rows:
                 cells = row.find_all('td')
                 if len(cells) < 8:
@@ -191,7 +183,7 @@ class LibGenEngine:
                     else:
                         page_results.append(book)
             
-            # Batch bypass
+            # ✅ Bypass ads
             if ads_urls:
                 real_urls = self._batch_bypass(ads_urls)
                 for book, real_url in zip(ads_books, real_urls):
@@ -209,7 +201,6 @@ class LibGenEngine:
             return [], 0
 
     def _batch_bypass(self, ads_urls: List[str]) -> List[Optional[str]]:
-        """Fast batch bypass"""
         if not ads_urls:
             return []
         
@@ -226,7 +217,6 @@ class LibGenEngine:
             return results
 
     def _bypass_single(self, ads_url: str) -> Optional[str]:
-        """Single bypass"""
         try:
             resp = self.session.post(
                 f"{self.adbypass_api}/bypass",
@@ -247,12 +237,11 @@ class LibGenEngine:
             return None
 
     def _build_search_url(self, query: str, page: int) -> str:
-        """Minimal URL builder"""
         query = query.replace(' ', '+')
         return f"{self.base_url}/index.php?req={query}&res=25&filesuns=all&curtab=f&page={page}"
 
     def _parse_row(self, row, cells) -> Optional[Dict]:
-        """Parse row"""
+        """✅ FIXED: Always extract download_url properly"""
         try:
             bold = cells[0].find('b')
             title = bold.get_text(strip=True) if bold else cells[0].get_text(strip=True)[:80]
@@ -262,40 +251,56 @@ class LibGenEngine:
             ads_url = None
             download_url = None
             
+            # ✅ First pass: Find get.php with key (already real URL)
             for cell in cells:
                 for link in cell.find_all('a'):
                     href = link.get('href', '')
                     
-                    if 'ads.php?md5=' in href:
-                        match = re.search(r'md5=([a-f0-9]{32})', href)
-                        if match:
-                            md5 = match.group(1)
-                            ads_url = f"{self.base_url}{href}"
-                            break
-                    
+                    # get.php with key = already real URL
                     if 'get.php?md5=' in href and '&key=' in href:
                         match = re.search(r'md5=([a-f0-9]{32})', href)
                         if match:
                             md5 = match.group(1)
                             download_url = f"{self.base_url}{href}"
-                            break
-                    
-                    if 'get.php?md5=' in href:
-                        match = re.search(r'md5=([a-f0-9]{32})', href)
-                        if match:
-                            md5 = match.group(1)
-                            ads_url = f"{self.base_url}/ads.php?md5={md5}"
+                            print(f"✅ Found direct URL: {download_url}")
                             break
                 
-                if md5:
+                if download_url:
                     break
             
-            if not md5:
-                text = cells[0].get_text()
-                match = re.search(r'md5[=:]\s*([a-f0-9]{32})', text, re.I)
-                if match:
-                    md5 = match.group(1)
-                    ads_url = f"{self.base_url}/ads.php?md5={md5}"
+            # ✅ Second pass: Find ads.php (needs bypass)
+            if not download_url:
+                for cell in cells:
+                    for link in cell.find_all('a'):
+                        href = link.get('href', '')
+                        
+                        if 'ads.php?md5=' in href:
+                            match = re.search(r'md5=([a-f0-9]{32})', href)
+                            if match:
+                                md5 = match.group(1)
+                                ads_url = f"{self.base_url}{href}"
+                                print(f"🔄 Found ads URL: {ads_url}")
+                                break
+                    
+                    if ads_url:
+                        break
+            
+            # ✅ Third pass: Find get.php without key (need ads.php fallback)
+            if not download_url and not ads_url:
+                for cell in cells:
+                    for link in cell.find_all('a'):
+                        href = link.get('href', '')
+                        
+                        if 'get.php?md5=' in href:
+                            match = re.search(r'md5=([a-f0-9]{32})', href)
+                            if match:
+                                md5 = match.group(1)
+                                ads_url = f"{self.base_url}/ads.php?md5={md5}"
+                                print(f"🔄 Created ads URL from get.php: {ads_url}")
+                                break
+                    
+                    if ads_url:
+                        break
             
             return {
                 'title': title[:100],
@@ -307,12 +312,14 @@ class LibGenEngine:
                 'size': cells[6].get_text(strip=True) if len(cells) > 6 else "",
                 'extension': cells[7].get_text(strip=True).lower() if len(cells) > 7 else 'unknown',
                 'md5': md5,
-                'download_url': download_url,
+                'ads_url': ads_url,
+                'download_url': download_url,  # ✅ This will be filled by bypass
                 'bypass_success': False,
                 'is_book': bool(row.find('span', class_='badge', string=re.compile(r'b'))),
                 'is_comic': bool(row.find('span', class_='badge', string=re.compile(r'c')))
             }
-        except:
+        except Exception as e:
+            print(f"Parse error: {e}")
             return None
 
     def _apply_filters(self, book: Dict, filters: Dict) -> bool:
@@ -325,7 +332,6 @@ class LibGenEngine:
         return True
 
     def get_by_md5(self, md5: str) -> Dict:
-        """Get download URL by MD5"""
         start_time = time.time()
         
         cached = cache.get(f"md5:{md5}")
@@ -377,26 +383,19 @@ engine = LibGenEngine()
 async def root():
     return {
         "name": "LibGen API",
-        "version": "8.0.0",
-        "description": "Search LibGen with results limit control",
+        "version": "9.0.0",
+        "description": "Search LibGen with results limit + working download links",
         "parameters": {
             "query": "Required - Search term",
-            "format": "Optional - File format filter (pdf, epub, mobi, etc.)",
-            "author": "Optional - Author name filter",
-            "language": "Optional - Language filter (en, ru, fr, etc.)",
-            "limit": "Optional - Number of results to return (default: 25, max: 50)",
+            "format": "Optional - File format filter",
+            "author": "Optional - Author filter",
+            "language": "Optional - Language filter",
+            "limit": "Optional - Number of results (default: 25, max: 50)",
             "max_pages": "Optional - Pages to fetch (default: 1, max: 2)"
         },
         "examples": {
-            "search_1_book": "/search?query=think+and+grow+rich&limit=1",
-            "search_5_books": "/search?query=psychology&format=pdf&limit=5",
-            "search_by_author": "/search?query=python&author=O%27Reilly&limit=10"
-        },
-        "endpoints": {
-            "/search": "Search with results limit",
-            "/download/{md5}": "Get download URL by MD5",
-            "/formats": "Available formats",
-            "/cache/clear": "Clear cache"
+            "get_1_book": "/search?query=think+and+grow+rich&limit=1",
+            "get_5_pdfs": "/search?query=psychology&format=pdf&limit=5"
         }
     }
 
@@ -415,20 +414,13 @@ async def clear_cache():
 @app.get("/search")
 async def search(
     query: str = Query(..., description="Search term"),
-    format: Optional[str] = Query(None, description="Filter by format (pdf, epub, mobi, etc.)"),
+    format: Optional[str] = Query(None, description="Filter by format"),
     author: Optional[str] = Query(None, description="Filter by author"),
-    language: Optional[str] = Query(None, description="Filter by language (en, ru, fr, etc.)"),
-    limit: int = Query(25, ge=1, le=50, description="Number of results to return (max: 50)"),
+    language: Optional[str] = Query(None, description="Filter by language"),
+    limit: int = Query(25, ge=1, le=50, description="Number of results (max: 50)"),
     max_pages: int = Query(1, ge=1, le=2, description="Pages to fetch (max: 2)")
 ):
-    """
-    ⚡ Search LibGen with results limit
-    
-    Examples:
-    - Get 1 book: /search?query=think+and+grow+rich&limit=1
-    - Get 5 PDFs: /search?query=psychology&format=pdf&limit=5
-    - Get 10 by author: /search?query=python&author=O%27Reilly&limit=10
-    """
+    """⚡ Search with limit + working download links"""
     if not query:
         raise HTTPException(400, "Query parameter is required")
     
@@ -460,7 +452,7 @@ async def get_download_url(md5: str):
     start_time = time.time()
     
     if not md5 or len(md5) != 32:
-        raise HTTPException(400, "Invalid MD5 hash (must be 32 characters)")
+        raise HTTPException(400, "Invalid MD5 hash")
     
     try:
         result = engine.get_by_md5(md5)
@@ -479,32 +471,16 @@ async def get_download_url(md5: str):
 async def get_formats():
     return {
         "formats": {
-            "pdf": "PDF Documents",
-            "epub": "EPUB E-books",
-            "mobi": "Mobi (Kindle)",
-            "azw3": "AZW3 (Kindle)",
-            "djvu": "DJVU Scanned",
-            "doc": "Word Documents",
-            "txt": "Plain Text",
-            "fb2": "FictionBook",
-            "cbr": "Comic Book (RAR)",
-            "cbz": "Comic Book (ZIP)"
-        },
-        "languages": {
-            "en": "English",
-            "ru": "Russian",
-            "fr": "French",
-            "de": "German",
-            "es": "Spanish",
-            "it": "Italian",
-            "pt": "Portuguese",
-            "nl": "Dutch",
-            "pl": "Polish",
-            "uk": "Ukrainian",
-            "zh": "Chinese",
-            "ja": "Japanese",
-            "ar": "Arabic",
-            "hi": "Hindi"
+            "pdf": "PDF",
+            "epub": "EPUB",
+            "mobi": "MOBI",
+            "azw3": "AZW3",
+            "djvu": "DJVU",
+            "doc": "DOC",
+            "txt": "TXT",
+            "fb2": "FB2",
+            "cbr": "CBR",
+            "cbz": "CBZ"
         }
     }
 
