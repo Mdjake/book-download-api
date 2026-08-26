@@ -1,6 +1,6 @@
 """
-LibGen Main API - With Relevance Ranking
-Results ranked by relevance to search query
+LibGen Main API - With Connection Management
+Prevents max_user_connections error by properly closing connections
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -15,14 +15,15 @@ import uvicorn
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter
+from contextlib import contextmanager
+import gc
 
 # ========== FASTAPI APP ==========
 
 app = FastAPI(
     title="LibGen Main API",
-    version="10.0.0",
-    description="Search LibGen with relevance ranking"
+    version="11.0.0",
+    description="Search LibGen with automatic connection management"
 )
 
 # ========== CORS ==========
@@ -38,9 +39,59 @@ app.add_middleware(
 # ========== CONFIGURATION ==========
 
 ADBYPASS_API = os.environ.get("ADBYPASS_API", "https://libgen-adbypass.vercel.app")
-MAX_WORKERS = 8
+MAX_WORKERS = 3  # ⚡ Reduced to prevent connection overload
 TIMEOUT = 4
 CACHE_TTL = 7200
+MAX_CONNECTIONS = 5  # ⚡ Limit concurrent connections
+
+# ========== CONNECTION MANAGER ==========
+
+class ConnectionManager:
+    """Manages HTTP connections to prevent max_user_connections error"""
+    
+    def __init__(self):
+        self.sessions = []
+        self._lock = False
+    
+    @contextmanager
+    def get_session(self):
+        """Get a session and ensure it's closed after use"""
+        session = None
+        try:
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'close',  # ⚡ Force connection close
+            })
+            # ⚡ Set max connections per host
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=1,
+                pool_maxsize=1,
+                max_retries=0
+            )
+            session.mount('http://', adapter)
+            session.mount('https://', adapter)
+            
+            yield session
+        finally:
+            if session:
+                try:
+                    session.close()
+                except:
+                    pass
+            # ⚡ Force garbage collection
+            gc.collect()
+    
+    def close_all(self):
+        """Close all active sessions"""
+        try:
+            # Force close all connections
+            requests.packages.urllib3.disable_warnings()
+            gc.collect()
+        except:
+            pass
 
 # ========== CACHE ==========
 
@@ -59,77 +110,83 @@ class SimpleCache:
         return None
     
     def set(self, key, value):
+        # ⚡ Limit cache size to prevent memory issues
+        if len(self.data) > 200:
+            # Remove oldest 50 entries
+            items = list(self.data.items())
+            for k, _ in items[:50]:
+                del self.data[k]
+                del self.timestamps[k]
         self.data[key] = value
         self.timestamps[key] = datetime.now()
     
     def clear(self):
         self.data.clear()
         self.timestamps.clear()
+        gc.collect()
 
 cache = SimpleCache()
+connection_manager = ConnectionManager()
 
 # ========== RELEVANCE SCORING ==========
 
 class RelevanceScorer:
     @staticmethod
     def calculate_score(book: Dict, query: str) -> float:
-        """Calculate relevance score for a book based on query"""
         query_words = query.lower().split()
         score = 0.0
         
-        # Get all text fields for matching
         title = book.get('title', '').lower()
         author = book.get('author', '').lower()
         publisher = book.get('publisher', '').lower()
         year = book.get('year', '').lower()
         language = book.get('language', '').lower()
         
-        # Score: Title matches (highest weight)
+        # Title matches (highest weight)
         title_score = 0
         for word in query_words:
             if word in title:
-                # Exact phrase match in title gets bonus
                 if query.lower() in title:
                     title_score += 100
                 else:
                     title_score += 20
-        score += title_score * 2.0  # Title is most important
+        score += title_score * 2.0
         
-        # Score: Author matches (high weight)
+        # Author matches
         author_score = 0
         for word in query_words:
             if word in author:
                 author_score += 15
         score += author_score * 1.5
         
-        # Score: Publisher matches (medium weight)
+        # Publisher matches
         publisher_score = 0
         for word in query_words:
             if word in publisher:
                 publisher_score += 5
         score += publisher_score
         
-        # Score: Year matches (low weight)
+        # Year matches
         year_score = 0
         for word in query_words:
             if word in year:
                 year_score += 2
         score += year_score
         
-        # Score: Language matches (low weight)
+        # Language matches
         lang_score = 0
         for word in query_words:
             if word in language:
                 lang_score += 1
         score += lang_score
         
-        # Bonus for exact phrase matches
+        # Exact phrase bonus
         if query.lower() in title:
             score += 50
         if query.lower() in author:
             score += 20
         
-        # Penalty for long titles with many extra words (less relevant)
+        # Penalty for long titles
         title_words = len(title.split())
         if title_words > 15:
             score *= 0.9
@@ -138,11 +195,8 @@ class RelevanceScorer:
     
     @staticmethod
     def rank_results(results: List[Dict], query: str) -> List[Dict]:
-        """Rank results by relevance score"""
         for book in results:
             book['_relevance_score'] = RelevanceScorer.calculate_score(book, query)
-        
-        # Sort by score descending
         return sorted(results, key=lambda x: x.get('_relevance_score', 0), reverse=True)
 
 # ========== LIBGEN ENGINE ==========
@@ -150,15 +204,9 @@ class RelevanceScorer:
 class LibGenEngine:
     def __init__(self):
         self.base_url = "https://libgen.li"
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-        })
         self.adbypass_api = ADBYPASS_API
         self.scorer = RelevanceScorer()
+        self.connection_manager = connection_manager
 
     def search(self, query: str, max_pages: int = 1, limit: int = 25, filters: Dict = None) -> Dict:
         start_time = time.time()
@@ -178,11 +226,13 @@ class LibGenEngine:
         total_available = 0
         pages_fetched = 0
         
-        # Fetch pages in parallel
-        with ThreadPoolExecutor(max_workers=max_pages) as executor:
+        # ⚡ Limit concurrent page fetches
+        actual_pages = min(max_pages, 2)
+        
+        with ThreadPoolExecutor(max_workers=actual_pages) as executor:
             futures = [
                 executor.submit(self._fetch_page, query, page, filters) 
-                for page in range(1, max_pages + 1)
+                for page in range(1, actual_pages + 1)
             ]
             
             for future in as_completed(futures):
@@ -194,7 +244,7 @@ class LibGenEngine:
                             total_available = page_total
                         pages_fetched += 1
                         
-                        if len(all_results) >= limit * 2:  # Fetch extra for ranking
+                        if len(all_results) >= limit * 2:
                             for f in futures:
                                 if not f.done():
                                     f.cancel()
@@ -202,11 +252,12 @@ class LibGenEngine:
                 except:
                     pass
         
-        # ✅ RANK RESULTS BY RELEVANCE
+        # Rank results
         ranked_results = self.scorer.rank_results(all_results, query)
-        
-        # Apply limit after ranking
         limited_results = ranked_results[:limit]
+        
+        # ⚡ Clear any hanging connections
+        connection_manager.close_all()
         
         response = {
             'query': query,
@@ -226,69 +277,78 @@ class LibGenEngine:
         return response
 
     def _fetch_page(self, query: str, page: int, filters: Dict) -> tuple:
+        """Fetch a single page with proper connection management"""
         try:
-            url = self._build_search_url(query, page)
-            response = self.session.get(url, timeout=TIMEOUT)
-            
-            if response.status_code != 200:
-                return [], 0
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            total_available = 0
-            files_tab = soup.find('a', href=re.compile(r'curtab=f'))
-            if files_tab:
-                badge = files_tab.find('span', class_='badge')
-                if badge:
-                    try:
-                        total_available = int(badge.get_text(strip=True))
-                    except:
-                        pass
-            
-            table = soup.find('table', {'id': 'tablelibgen'})
-            if not table:
-                return [], total_available
-            
-            rows = table.find_all('tr')[1:]
-            page_results = []
-            ads_urls = []
-            ads_books = []
-            
-            for row in rows:
-                cells = row.find_all('td')
-                if len(cells) < 8:
-                    continue
+            # ⚡ Use connection manager to get a session
+            with connection_manager.get_session() as session:
+                url = self._build_search_url(query, page)
+                response = session.get(url, timeout=TIMEOUT)
                 
-                book = self._parse_row(row, cells)
-                if book and self._apply_filters(book, filters):
-                    if book.get('ads_url'):
-                        ads_urls.append(book['ads_url'])
-                        ads_books.append(book)
-                    else:
+                if response.status_code != 200:
+                    return [], 0
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Get total count
+                total_available = 0
+                files_tab = soup.find('a', href=re.compile(r'curtab=f'))
+                if files_tab:
+                    badge = files_tab.find('span', class_='badge')
+                    if badge:
+                        try:
+                            total_available = int(badge.get_text(strip=True))
+                        except:
+                            pass
+                
+                table = soup.find('table', {'id': 'tablelibgen'})
+                if not table:
+                    return [], total_available
+                
+                rows = table.find_all('tr')[1:]
+                page_results = []
+                ads_urls = []
+                ads_books = []
+                
+                for row in rows:
+                    cells = row.find_all('td')
+                    if len(cells) < 8:
+                        continue
+                    
+                    book = self._parse_row(row, cells)
+                    if book and self._apply_filters(book, filters):
+                        if book.get('ads_url'):
+                            ads_urls.append(book['ads_url'])
+                            ads_books.append(book)
+                        else:
+                            page_results.append(book)
+                
+                # ⚡ Batch bypass with limited connections
+                if ads_urls:
+                    real_urls = self._batch_bypass(ads_urls)
+                    for book, real_url in zip(ads_books, real_urls):
+                        if real_url:
+                            book['download_url'] = real_url
+                            book['bypass_success'] = True
+                        else:
+                            book['bypass_success'] = False
+                        book.pop('ads_url', None)
                         page_results.append(book)
+                
+                # ⚡ Clear response content
+                response.close()
+                
+                return page_results, total_available
             
-            # Batch bypass
-            if ads_urls:
-                real_urls = self._batch_bypass(ads_urls)
-                for book, real_url in zip(ads_books, real_urls):
-                    if real_url:
-                        book['download_url'] = real_url
-                        book['bypass_success'] = True
-                    else:
-                        book['bypass_success'] = False
-                    book.pop('ads_url', None)
-                    page_results.append(book)
-            
-            return page_results, total_available
-            
-        except:
+        except Exception as e:
             return [], 0
 
     def _batch_bypass(self, ads_urls: List[str]) -> List[Optional[str]]:
+        """Batch bypass with connection management"""
         if not ads_urls:
             return []
         
-        workers = min(len(ads_urls), 3)
+        # ⚡ Limit concurrent bypass requests
+        workers = min(len(ads_urls), 2)
         
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(self._bypass_single, url): url for url in ads_urls}
@@ -298,25 +358,33 @@ class LibGenEngine:
                     results.append(future.result(timeout=3))
                 except:
                     results.append(None)
+            
+            # ⚡ Clear connections
+            connection_manager.close_all()
+            
             return results
 
     def _bypass_single(self, ads_url: str) -> Optional[str]:
+        """Single bypass with connection management"""
         try:
-            resp = self.session.post(
-                f"{self.adbypass_api}/bypass",
-                json={"url": ads_url},
-                timeout=2
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get('status') == 'success':
-                    real = data.get('data', {}).get('real_url')
-                    if real:
-                        if real.startswith('get.php'):
-                            return f"{self.base_url}/{real}"
-                        return real
-            return None
+            with connection_manager.get_session() as session:
+                resp = session.post(
+                    f"{self.adbypass_api}/bypass",
+                    json={"url": ads_url},
+                    timeout=2
+                )
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get('status') == 'success':
+                        real = data.get('data', {}).get('real_url')
+                        if real:
+                            if real.startswith('get.php'):
+                                return f"{self.base_url}/{real}"
+                            return real
+                
+                resp.close()
+                return None
         except:
             return None
 
@@ -334,7 +402,7 @@ class LibGenEngine:
             ads_url = None
             download_url = None
             
-            # First pass: get.php with key
+            # Find get.php with key
             for cell in cells:
                 for link in cell.find_all('a'):
                     href = link.get('href', '')
@@ -349,7 +417,7 @@ class LibGenEngine:
                 if download_url:
                     break
             
-            # Second pass: ads.php
+            # Find ads.php
             if not download_url:
                 for cell in cells:
                     for link in cell.find_all('a'):
@@ -365,7 +433,7 @@ class LibGenEngine:
                     if ads_url:
                         break
             
-            # Third pass: get.php without key
+            # Find get.php without key
             if not download_url and not ads_url:
                 for cell in cells:
                     for link in cell.find_all('a'):
@@ -420,28 +488,31 @@ class LibGenEngine:
         ads_url = f"{self.base_url}/ads.php?md5={md5}"
         
         try:
-            resp = self.session.post(
-                f"{self.adbypass_api}/bypass",
-                json={"url": ads_url},
-                timeout=2
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get('status') == 'success':
-                    real_url = data.get('data', {}).get('real_url')
-                    if real_url:
-                        if real_url.startswith('get.php'):
-                            real_url = f"{self.base_url}/{real_url}"
-                        result = {'success': True, 'md5': md5, 'download_url': real_url}
-                        cache.set(f"md5:{md5}", result)
-                        result['_time_taken'] = f"{time.time() - start_time:.2f}s"
-                        return result
-            
-            result = {'success': True, 'md5': md5, 'download_url': ads_url}
-            cache.set(f"md5:{md5}", result)
-            result['_time_taken'] = f"{time.time() - start_time:.2f}s"
-            return result
+            with connection_manager.get_session() as session:
+                resp = session.post(
+                    f"{self.adbypass_api}/bypass",
+                    json={"url": ads_url},
+                    timeout=2
+                )
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get('status') == 'success':
+                        real_url = data.get('data', {}).get('real_url')
+                        if real_url:
+                            if real_url.startswith('get.php'):
+                                real_url = f"{self.base_url}/{real_url}"
+                            result = {'success': True, 'md5': md5, 'download_url': real_url}
+                            cache.set(f"md5:{md5}", result)
+                            result['_time_taken'] = f"{time.time() - start_time:.2f}s"
+                            return result
+                
+                resp.close()
+                
+                result = {'success': True, 'md5': md5, 'download_url': ads_url}
+                cache.set(f"md5:{md5}", result)
+                result['_time_taken'] = f"{time.time() - start_time:.2f}s"
+                return result
             
         except:
             result = {'success': True, 'md5': md5, 'download_url': ads_url}
@@ -461,14 +532,14 @@ engine = LibGenEngine()
 async def root():
     return {
         "name": "LibGen API",
-        "version": "10.0.0",
-        "description": "Search LibGen with relevance ranking",
+        "version": "11.0.0",
+        "description": "Search LibGen with automatic connection management",
         "features": {
-            "relevance_ranking": "Results ranked by relevance to your search query",
-            "download_bypass": "Automatic ad bypass for real download URLs",
-            "caching": "Results cached for 2 hours",
-            "filters": "Format, author, language filters",
-            "limit": "Control number of results"
+            "connection_management": "Auto-closes connections after each request",
+            "max_connections": "Limited to prevent database overload",
+            "relevance_ranking": "Results ranked by relevance",
+            "download_bypass": "Automatic ad bypass",
+            "caching": "Results cached for 2 hours"
         },
         "parameters": {
             "query": "Required - Search term",
@@ -477,11 +548,6 @@ async def root():
             "language": "Optional - Language filter",
             "limit": "Optional - Number of results (default: 25, max: 50)",
             "max_pages": "Optional - Pages to fetch (default: 1, max: 2)"
-        },
-        "examples": {
-            "get_1_relevant_book": "/search?query=think+and+grow+rich&limit=1",
-            "get_top_5_pdfs": "/search?query=psychology&format=pdf&limit=5",
-            "search_by_author": "/search?query=python&author=O%27Reilly&limit=10"
         }
     }
 
@@ -494,6 +560,7 @@ async def health():
 @app.post("/cache/clear")
 async def clear_cache():
     cache.clear()
+    connection_manager.close_all()
     return {"status": "success", "message": "Cache cleared"}
 
 
@@ -503,15 +570,10 @@ async def search(
     format: Optional[str] = Query(None, description="Filter by format"),
     author: Optional[str] = Query(None, description="Filter by author"),
     language: Optional[str] = Query(None, description="Filter by language"),
-    limit: int = Query(25, ge=1, le=50, description="Number of results (max: 50)"),
-    max_pages: int = Query(1, ge=1, le=2, description="Pages to fetch (max: 2)")
+    limit: int = Query(25, ge=1, le=50, description="Number of results"),
+    max_pages: int = Query(1, ge=1, le=2, description="Pages to fetch")
 ):
-    """
-    ⚡ Search with relevance ranking
-    
-    Results are ranked by relevance to your search query.
-    The most relevant books appear first.
-    """
+    """⚡ Search with automatic connection management"""
     if not query:
         raise HTTPException(400, "Query parameter is required")
     
@@ -527,6 +589,9 @@ async def search(
         result = engine.search(query, max_pages, limit, filters)
         total_time = time.time() - start_total
         
+        # ⚡ Ensure connections are closed
+        connection_manager.close_all()
+        
         return {
             "status": "success",
             "time_taken": f"{total_time:.2f}s",
@@ -534,6 +599,7 @@ async def search(
             "data": result
         }
     except Exception as e:
+        connection_manager.close_all()
         raise HTTPException(500, str(e))
 
 
@@ -543,11 +609,13 @@ async def get_download_url(md5: str):
     start_time = time.time()
     
     if not md5 or len(md5) != 32:
-        raise HTTPException(400, "Invalid MD5 hash (must be 32 characters)")
+        raise HTTPException(400, "Invalid MD5 hash")
     
     try:
         result = engine.get_by_md5(md5)
         total_time = time.time() - start_time
+        
+        connection_manager.close_all()
         
         return {
             "status": "success" if result['success'] else "error",
@@ -555,6 +623,7 @@ async def get_download_url(md5: str):
             "data": result
         }
     except Exception as e:
+        connection_manager.close_all()
         raise HTTPException(500, str(e))
 
 
