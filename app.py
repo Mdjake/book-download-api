@@ -1,6 +1,6 @@
 """
-LibGen Main API - With Connection Management
-Prevents max_user_connections error by properly closing connections
+LibGen Main API - Fixed Cache
+Never caches empty results
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -22,7 +22,7 @@ import gc
 
 app = FastAPI(
     title="LibGen Main API",
-    version="11.0.0",
+    version="12.0.0",
     description="Search LibGen with automatic connection management"
 )
 
@@ -39,23 +39,18 @@ app.add_middleware(
 # ========== CONFIGURATION ==========
 
 ADBYPASS_API = os.environ.get("ADBYPASS_API", "https://libgen-adbypass.vercel.app")
-MAX_WORKERS = 3  # ⚡ Reduced to prevent connection overload
+MAX_WORKERS = 3
 TIMEOUT = 4
 CACHE_TTL = 7200
-MAX_CONNECTIONS = 5  # ⚡ Limit concurrent connections
 
 # ========== CONNECTION MANAGER ==========
 
 class ConnectionManager:
-    """Manages HTTP connections to prevent max_user_connections error"""
-    
     def __init__(self):
         self.sessions = []
-        self._lock = False
     
     @contextmanager
     def get_session(self):
-        """Get a session and ensure it's closed after use"""
         session = None
         try:
             session = requests.Session()
@@ -63,9 +58,8 @@ class ConnectionManager:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
                 'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'close',  # ⚡ Force connection close
+                'Connection': 'close',
             })
-            # ⚡ Set max connections per host
             adapter = requests.adapters.HTTPAdapter(
                 pool_connections=1,
                 pool_maxsize=1,
@@ -73,7 +67,6 @@ class ConnectionManager:
             )
             session.mount('http://', adapter)
             session.mount('https://', adapter)
-            
             yield session
         finally:
             if session:
@@ -81,19 +74,15 @@ class ConnectionManager:
                     session.close()
                 except:
                     pass
-            # ⚡ Force garbage collection
             gc.collect()
     
     def close_all(self):
-        """Close all active sessions"""
         try:
-            # Force close all connections
-            requests.packages.urllib3.disable_warnings()
             gc.collect()
         except:
             pass
 
-# ========== CACHE ==========
+# ========== CACHE - FIXED ==========
 
 class SimpleCache:
     def __init__(self):
@@ -110,13 +99,23 @@ class SimpleCache:
         return None
     
     def set(self, key, value):
-        # ⚡ Limit cache size to prevent memory issues
+        # ✅ FIX: Don't cache empty results
+        if not value:
+            return
+        
+        # ✅ FIX: Don't cache if results are empty
+        if isinstance(value, dict):
+            results = value.get('results', [])
+            if not results or len(results) == 0:
+                return
+        
+        # Limit cache size
         if len(self.data) > 200:
-            # Remove oldest 50 entries
             items = list(self.data.items())
             for k, _ in items[:50]:
                 del self.data[k]
                 del self.timestamps[k]
+        
         self.data[key] = value
         self.timestamps[key] = datetime.now()
     
@@ -142,7 +141,7 @@ class RelevanceScorer:
         year = book.get('year', '').lower()
         language = book.get('language', '').lower()
         
-        # Title matches (highest weight)
+        # Title matches
         title_score = 0
         for word in query_words:
             if word in title:
@@ -186,11 +185,6 @@ class RelevanceScorer:
         if query.lower() in author:
             score += 20
         
-        # Penalty for long titles
-        title_words = len(title.split())
-        if title_words > 15:
-            score *= 0.9
-        
         return score
     
     @staticmethod
@@ -226,7 +220,6 @@ class LibGenEngine:
         total_available = 0
         pages_fetched = 0
         
-        # ⚡ Limit concurrent page fetches
         actual_pages = min(max_pages, 2)
         
         with ThreadPoolExecutor(max_workers=actual_pages) as executor:
@@ -252,24 +245,37 @@ class LibGenEngine:
                 except:
                     pass
         
-        # Rank results
-        ranked_results = self.scorer.rank_results(all_results, query)
-        limited_results = ranked_results[:limit]
+        # ✅ FIX: Only cache if we have results
+        if all_results:
+            ranked_results = self.scorer.rank_results(all_results, query)
+            limited_results = ranked_results[:limit]
+            
+            response = {
+                'query': query,
+                'total_results': len(limited_results),
+                'total_available': total_available,
+                'pages_fetched': pages_fetched,
+                'limit_applied': limit,
+                'ranking_applied': True,
+                'results': limited_results
+            }
+            
+            # ✅ Only cache if we have results
+            if limited_results:
+                cache.set(cache_key, response)
+        else:
+            # ✅ Empty response - don't cache
+            response = {
+                'query': query,
+                'total_results': 0,
+                'total_available': 0,
+                'pages_fetched': 0,
+                'limit_applied': limit,
+                'ranking_applied': True,
+                'results': []
+            }
         
-        # ⚡ Clear any hanging connections
         connection_manager.close_all()
-        
-        response = {
-            'query': query,
-            'total_results': len(limited_results),
-            'total_available': total_available,
-            'pages_fetched': pages_fetched,
-            'limit_applied': limit,
-            'ranking_applied': True,
-            'results': limited_results
-        }
-        
-        cache.set(cache_key, response)
         
         elapsed = time.time() - start_time
         response['_time_taken'] = f"{elapsed:.2f}s"
@@ -277,9 +283,7 @@ class LibGenEngine:
         return response
 
     def _fetch_page(self, query: str, page: int, filters: Dict) -> tuple:
-        """Fetch a single page with proper connection management"""
         try:
-            # ⚡ Use connection manager to get a session
             with connection_manager.get_session() as session:
                 url = self._build_search_url(query, page)
                 response = session.get(url, timeout=TIMEOUT)
@@ -289,7 +293,6 @@ class LibGenEngine:
                 
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Get total count
                 total_available = 0
                 files_tab = soup.find('a', href=re.compile(r'curtab=f'))
                 if files_tab:
@@ -322,7 +325,6 @@ class LibGenEngine:
                         else:
                             page_results.append(book)
                 
-                # ⚡ Batch bypass with limited connections
                 if ads_urls:
                     real_urls = self._batch_bypass(ads_urls)
                     for book, real_url in zip(ads_books, real_urls):
@@ -334,20 +336,16 @@ class LibGenEngine:
                         book.pop('ads_url', None)
                         page_results.append(book)
                 
-                # ⚡ Clear response content
                 response.close()
-                
                 return page_results, total_available
             
-        except Exception as e:
+        except:
             return [], 0
 
     def _batch_bypass(self, ads_urls: List[str]) -> List[Optional[str]]:
-        """Batch bypass with connection management"""
         if not ads_urls:
             return []
         
-        # ⚡ Limit concurrent bypass requests
         workers = min(len(ads_urls), 2)
         
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -359,13 +357,10 @@ class LibGenEngine:
                 except:
                     results.append(None)
             
-            # ⚡ Clear connections
             connection_manager.close_all()
-            
             return results
 
     def _bypass_single(self, ads_url: str) -> Optional[str]:
-        """Single bypass with connection management"""
         try:
             with connection_manager.get_session() as session:
                 resp = session.post(
@@ -402,7 +397,6 @@ class LibGenEngine:
             ads_url = None
             download_url = None
             
-            # Find get.php with key
             for cell in cells:
                 for link in cell.find_all('a'):
                     href = link.get('href', '')
@@ -417,7 +411,6 @@ class LibGenEngine:
                 if download_url:
                     break
             
-            # Find ads.php
             if not download_url:
                 for cell in cells:
                     for link in cell.find_all('a'):
@@ -433,7 +426,6 @@ class LibGenEngine:
                     if ads_url:
                         break
             
-            # Find get.php without key
             if not download_url and not ads_url:
                 for cell in cells:
                     for link in cell.find_all('a'):
@@ -532,22 +524,13 @@ engine = LibGenEngine()
 async def root():
     return {
         "name": "LibGen API",
-        "version": "11.0.0",
+        "version": "12.0.0",
         "description": "Search LibGen with automatic connection management",
         "features": {
             "connection_management": "Auto-closes connections after each request",
-            "max_connections": "Limited to prevent database overload",
             "relevance_ranking": "Results ranked by relevance",
             "download_bypass": "Automatic ad bypass",
-            "caching": "Results cached for 2 hours"
-        },
-        "parameters": {
-            "query": "Required - Search term",
-            "format": "Optional - File format filter",
-            "author": "Optional - Author filter",
-            "language": "Optional - Language filter",
-            "limit": "Optional - Number of results (default: 25, max: 50)",
-            "max_pages": "Optional - Pages to fetch (default: 1, max: 2)"
+            "caching": "Results cached for 2 hours (only successful searches)"
         }
     }
 
@@ -589,7 +572,6 @@ async def search(
         result = engine.search(query, max_pages, limit, filters)
         total_time = time.time() - start_total
         
-        # ⚡ Ensure connections are closed
         connection_manager.close_all()
         
         return {
@@ -605,7 +587,6 @@ async def search(
 
 @app.get("/download/{md5}")
 async def get_download_url(md5: str):
-    """⚡ Get download URL by MD5"""
     start_time = time.time()
     
     if not md5 or len(md5) != 32:
@@ -641,22 +622,6 @@ async def get_formats():
             "fb2": "FictionBook",
             "cbr": "Comic Book (RAR)",
             "cbz": "Comic Book (ZIP)"
-        },
-        "languages": {
-            "en": "English",
-            "ru": "Russian",
-            "fr": "French",
-            "de": "German",
-            "es": "Spanish",
-            "it": "Italian",
-            "pt": "Portuguese",
-            "nl": "Dutch",
-            "pl": "Polish",
-            "uk": "Ukrainian",
-            "zh": "Chinese",
-            "ja": "Japanese",
-            "ar": "Arabic",
-            "hi": "Hindi"
         }
     }
 
