@@ -17,13 +17,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import gc
-
-# ========== FASTAPI APP ==========
-
+from fastapi.responses import ORJSONResponse
 app = FastAPI(
     title="LibGen Main API",
     version="12.0.0",
-    description="Search LibGen with automatic connection management"
+    description="Search LibGen with automatic connection management",
+    default_response_class=ORJSONResponse, 
 )
 
 # ========== CORS ==========
