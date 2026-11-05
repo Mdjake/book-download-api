@@ -342,23 +342,22 @@ class LibGenEngine:
             return [], 0
 
     def _batch_bypass(self, ads_urls: List[str]) -> List[Optional[str]]:
-        if not ads_urls:
-            return []
-        
-        workers = min(len(ads_urls), 2)
-        
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(self._bypass_single, url): url for url in ads_urls}
-            results = []
-            for future in as_completed(futures):
-                try:
-                    results.append(future.result(timeout=3))
-                except:
-                    results.append(None)
-            
-            connection_manager.close_all()
-            return results
+    if not ads_urls:
+        return []
 
+    workers = min(len(ads_urls), 2)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(self._bypass_single, url): url for url in ads_urls}
+        results = []
+        for future in futures:              # ✅ FIX: submission order, not as_completed
+            try:
+                results.append(future.result(timeout=3))
+            except:
+                results.append(None)
+
+        connection_manager.close_all()
+        return results
     def _bypass_single(self, ads_url: str) -> Optional[str]:
         try:
             with connection_manager.get_session() as session:
