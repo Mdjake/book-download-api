@@ -521,6 +521,17 @@ class LibGenEngine:
 engine = LibGenEngine()
 
 
+HIDDEN_FIELDS = {"download_url", "ads_url", "bypass_success"}
+
+
+def _public_book(book: Dict, base: str) -> Dict:
+    """Public shape of a book: no raw libgen links, only the clean redirect link."""
+    out = {k: v for k, v in book.items() if k not in HIDDEN_FIELDS}
+    if book.get("md5"):
+        out["clean_link"] = f"{base}/dl/{book['md5']}"
+    return out
+
+
 def _base(request: Request) -> str:
     """Public base URL of this API (set API_BASE_URL on Vercel for https)."""
     if API_BASE_URL:
@@ -588,10 +599,7 @@ def search(
         # Add clean link (no '&', nothing to escape) to each result
         base = _base(request)
         result = dict(result)
-        result['results'] = [
-            {**b, 'clean_link': f"{base}/dl/{b['md5']}"} if b.get('md5') else dict(b)
-            for b in result.get('results', [])
-        ]
+        result['results'] = [_public_book(b, base) for b in result.get('results', [])]
 
         total_time = time.time() - start_total
         connection_manager.close_all()
@@ -616,7 +624,7 @@ def get_download_url(request: Request, md5: str):
 
     try:
         result = engine.get_by_md5(md5.lower())
-        result = dict(result)
+        result = {k: v for k, v in result.items() if k != 'download_url'}
         result['clean_link'] = f"{_base(request)}/dl/{md5.lower()}"
         total_time = time.time() - start_time
 
